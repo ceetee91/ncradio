@@ -546,7 +546,7 @@ static void draw_help(void)
         mvprintw(y + 1, 2, "Any key: cancel seek");
         break;
     case M_SCANNING:
-        mvprintw(y + 1, 2, "s:stop & save   Esc:cancel (restore list)   q:save & quit");
+        mvprintw(y + 1, 2, "s:stop & save   Esc:cancel & discard");
         break;
     case M_TUNING:
         mvprintw(y + 1, 2,
@@ -559,11 +559,11 @@ static void draw_help(void)
         break;
     case M_SETTINGS:
         mvprintw(y + 1, 2,
-                 "Up/Dn:select   Left/Right:adjust   Enter:toggle (RDS names)   Esc/o:done");
+                 "Up/Dn:select   Left/Right:adjust   Enter:toggle   Esc/o:done");
         break;
     case M_NORMAL:
         mvprintw(y + 1, 2,
-                 "s:scan  ,:step<  .:step>  <:seek<  >:seek>  t:tune  m:mute  +/-:vol");
+                 "s:scan  ,:step-  .:step+  <:seek-  >:seek+  t:tune  m:mute  +/-:vol");
         mvprintw(y + 2, 2,
                  "a:add  d:del  e:rename  o:settings  Up/Dn  Left/Right:navigate  Enter:tune  q:quit");
         break;
