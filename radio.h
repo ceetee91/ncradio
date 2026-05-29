@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <pthread.h>
+#include <linux/videodev2.h>
 #include "rds.h"
 #include "config.h"   /* NAME_MAX_LEN, MAX_PRESETS */
 
@@ -17,6 +18,7 @@ typedef struct {
     uint32_t freq_hz;   /* current tuned frequency in Hz (pre-scan during scan) */
     int volume;         /* 0-100 */
     int muted;
+    struct v4l2_queryctrl volume_ctrl;  /* queried once at open; max>min means supported */
     RdsDecoder rds;     /* live RDS decoder state */
 
     /* scan parameters — set from config before calling radio_start_scan */

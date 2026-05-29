@@ -78,6 +78,11 @@ int radio_open(Radio *r, const char *device)
         ioctl(r->fd, VIDIOC_S_CTRL, &ctrl);
     }
 
+    memset(&r->volume_ctrl, 0, sizeof(r->volume_ctrl));
+    r->volume_ctrl.id = V4L2_CID_AUDIO_VOLUME;
+    if (ioctl(r->fd, VIDIOC_QUERYCTRL, &r->volume_ctrl) != 0)
+        memset(&r->volume_ctrl, 0, sizeof(r->volume_ctrl));
+
     r->freq_hz = radio_get_freq(r);
     if (r->freq_hz < FREQ_MIN_HZ || r->freq_hz > FREQ_MAX_HZ)
         r->freq_hz = 98500000;
@@ -128,9 +133,12 @@ int radio_set_volume(Radio *r, int vol)
     if (vol < 0)   vol = 0;
     if (vol > 100) vol = 100;
     r->volume = vol;
+    if (r->volume_ctrl.maximum <= r->volume_ctrl.minimum)
+        return 0;
+    int range = r->volume_ctrl.maximum - r->volume_ctrl.minimum;
     struct v4l2_control c = {
-        .id = V4L2_CID_AUDIO_VOLUME,
-        .value = (vol * 65535) / 100
+        .id    = V4L2_CID_AUDIO_VOLUME,
+        .value = (int)(vol / 100.0 * range + r->volume_ctrl.minimum)
     };
     return ioctl(r->fd, VIDIOC_S_CTRL, &c);
 }
