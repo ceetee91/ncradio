@@ -601,7 +601,7 @@ static void cancel_scan(void)
     set_msg("Scan cancelled.");
 }
 
-static void finish_scan(int quit_after)
+static void finish_scan(void)
 {
     radio_stop_scan(&radio);
 
@@ -630,8 +630,6 @@ static void finish_scan(int quit_after)
              "Scan done — found %d station%s, saved to ~/.ncradio.conf",
              config.count, config.count == 1 ? "" : "s");
     set_msg(msg);
-
-    if (quit_after) running = 0;
 }
 
 /* ── input ───────────────────────────────────────────────────────────── */
@@ -782,9 +780,8 @@ static void handle_key(int ch)
         break;
 
     case M_SCANNING:
-        if (ch == 's')   finish_scan(0);
+        if (ch == 's')   finish_scan();
         else if (ch == 27) cancel_scan();
-        else if (ch == 'q') finish_scan(1);
         break;
 
     case M_NORMAL:
@@ -1003,7 +1000,7 @@ int main(int argc, char *argv[])
         }
 
         if (mode == M_SCANNING && !radio.scanning && radio.scan_started)
-            finish_scan(0);
+            finish_scan();
 
         if (mode == M_SEEKING && !radio.seeking && radio.seek_started) {
             radio_stop_seek(&radio);
@@ -1027,7 +1024,7 @@ int main(int argc, char *argv[])
         if (ch != ERR) handle_key(ch);
     }
 
-    if (mode == M_SCANNING) finish_scan(0);
+    if (mode == M_SCANNING) finish_scan();
 
     endwin();
 #ifdef HAVE_AUDIO
