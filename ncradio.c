@@ -101,6 +101,11 @@ static void audio_apply(void)
 }
 #endif /* HAVE_AUDIO */
 
+/* station list saved before a scan so Esc can restore it */
+static int      prescan_count;
+static uint32_t prescan_freqs[MAX_PRESETS];
+static char     prescan_names[MAX_PRESETS][NAME_MAX_LEN + 1];
+
 /* cycle list for scan step (Hz) */
 static const uint32_t scan_steps[] = { 25000, 50000, 100000, 200000 };
 #define SCAN_STEP_COUNT 4
@@ -541,7 +546,7 @@ static void draw_help(void)
         mvprintw(y + 1, 2, "Any key: cancel seek");
         break;
     case M_SCANNING:
-        mvprintw(y + 1, 2, "s/Esc:stop scan & save   q:stop & quit");
+        mvprintw(y + 1, 2, "s:stop & save   Esc:cancel (restore list)   q:save & quit");
         break;
     case M_TUNING:
         mvprintw(y + 1, 2,
@@ -579,6 +584,22 @@ static void draw_all(void)
 }
 
 /* ── scan completion ─────────────────────────────────────────────────── */
+
+static void cancel_scan(void)
+{
+    radio_stop_scan(&radio);
+    config.count = prescan_count;
+    memcpy(config.freqs, prescan_freqs, sizeof(config.freqs));
+    memcpy(config.names, prescan_names, sizeof(config.names));
+    radio_set_freq(&radio, radio.freq_hz);
+    mode = M_NORMAL;
+    preset_sel  = 0;
+    list_offset = 0;
+#ifdef HAVE_AUDIO
+    if (config.audio_mute_scan) audio_apply();
+#endif
+    set_msg("Scan cancelled.");
+}
 
 static void finish_scan(int quit_after)
 {
@@ -761,8 +782,9 @@ static void handle_key(int ch)
         break;
 
     case M_SCANNING:
-        if (ch == 's' || ch == 27) finish_scan(0);
-        else if (ch == 'q')        finish_scan(1);
+        if (ch == 's')   finish_scan(0);
+        else if (ch == 27) cancel_scan();
+        else if (ch == 'q') finish_scan(1);
         break;
 
     case M_NORMAL:
@@ -772,6 +794,9 @@ static void handle_key(int ch)
             break;
 
         case 's':
+            prescan_count = config.count;
+            memcpy(prescan_freqs, config.freqs, sizeof(config.freqs));
+            memcpy(prescan_names, config.names, sizeof(config.names));
             radio.scan_step_hz   = config.scan_step_hz;
             radio.scan_threshold = (config.signal_threshold_pct * 65535) / 100;
             radio.scan_rds_names = config.rds_names;
