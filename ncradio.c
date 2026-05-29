@@ -32,24 +32,29 @@
 #define CP_VOL     6
 #define CP_SCAN    7
 #define CP_CUR     8
-#define CP_DIM     9
 
-typedef enum { M_NORMAL, M_TUNING, M_SCANNING } Mode;
+typedef enum { M_NORMAL, M_TUNING, M_SCANNING, M_EDITING } Mode;
 
 static Radio  radio;
 static Config config;
 static volatile int running = 1;
 static Mode mode = M_NORMAL;
 
-static int preset_sel    = 0;
-static int list_offset   = 0;
-static int signal_pct    = 0;
+static int preset_sel  = 0;
+static int list_offset = 0;
+static int signal_pct  = 0;
 
+/* tuning input */
 static char tune_buf[16];
 static int  tune_len = 0;
 
-static char    status_msg[128];
-static time_t  status_msg_exp = 0;
+/* preset name edit */
+static char edit_buf[NAME_MAX_LEN + 1];
+static int  edit_len = 0;
+
+/* timed status message */
+static char   status_msg[128];
+static time_t status_msg_exp = 0;
 
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
@@ -88,13 +93,23 @@ static void draw_title(void)
 
 static void draw_freq_signal(void)
 {
-    /* Frequency */
     attron(A_BOLD);
     mvprintw(ROW_FREQ, 2, "Freq: %6.2f MHz", radio.freq_hz / 1000000.0);
     attroff(A_BOLD);
 
+    /* Stereo / mono indicator */
+    if (radio.stereo) {
+        attron(COLOR_PAIR(CP_SIG_HI) | A_BOLD);
+        mvprintw(ROW_FREQ, 22, "[ST]");
+        attroff(COLOR_PAIR(CP_SIG_HI) | A_BOLD);
+    } else {
+        attron(A_DIM);
+        mvprintw(ROW_FREQ, 22, "[MO]");
+        attroff(A_DIM);
+    }
+
     /* Signal bar */
-    int sc = (COLS >= 60) ? 30 : 25;
+    int sc = (COLS >= 60) ? 30 : 27;
     int bw = (COLS >= 72) ? 14 : 10;
     int cp = (signal_pct >= 60) ? CP_SIG_HI :
              (signal_pct >= 30) ? CP_SIG_MED : CP_SIG_LO;
@@ -114,6 +129,17 @@ static void draw_volume(void)
         mvprintw(ROW_VOL, 32, " MUTED ");
         attroff(COLOR_PAIR(CP_SIG_LO) | A_BOLD | A_REVERSE);
     }
+
+    /* RDS station name — right-aligned on this row */
+    if (radio.rds_capable && radio.rds.ps_ready && radio.rds.ps[0]) {
+        int len = (int)strlen(radio.rds.ps);
+        int col = COLS - len - 2;
+        if (col > 42) {
+            attron(COLOR_PAIR(CP_CUR) | A_BOLD);
+            mvprintw(ROW_VOL, col, "%s", radio.rds.ps);
+            attroff(COLOR_PAIR(CP_CUR) | A_BOLD);
+        }
+    }
 }
 
 static void draw_info(void)
@@ -121,6 +147,10 @@ static void draw_info(void)
     if (mode == M_TUNING) {
         attron(A_BOLD);
         mvprintw(ROW_INFO, 2, "Tune (MHz): %s_", tune_buf);
+        attroff(A_BOLD);
+    } else if (mode == M_EDITING) {
+        attron(A_BOLD);
+        mvprintw(ROW_INFO, 2, "Name: %.*s_", NAME_MAX_LEN, edit_buf);
         attroff(A_BOLD);
     } else if (mode == M_SCANNING) {
         pthread_mutex_lock(&radio.mutex);
@@ -144,10 +174,17 @@ static void draw_info(void)
             draw_bar(ROW_INFO, x0, bw, pct, CP_SCAN);
             mvprintw(ROW_INFO, x0 + bw, "]%3d%%", pct);
         }
-    } else if (status_msg[0] && time(NULL) < status_msg_exp) {
-        attron(A_BOLD);
-        mvprintw(ROW_INFO, 2, "%.*s", COLS - 4, status_msg);
-        attroff(A_BOLD);
+    } else {
+        /* M_NORMAL: timed status message, then RDS radio text */
+        if (status_msg[0] && time(NULL) < status_msg_exp) {
+            attron(A_BOLD);
+            mvprintw(ROW_INFO, 2, "%.*s", COLS - 4, status_msg);
+            attroff(A_BOLD);
+        } else if (radio.rds_capable && radio.rds.rt_ready && radio.rds.rt[0]) {
+            attron(A_DIM);
+            mvprintw(ROW_INFO, 2, "%.*s", COLS - 4, radio.rds.rt);
+            attroff(A_DIM);
+        }
     }
 
     move(ROW_SEP2, 0); hline(ACS_HLINE, COLS);
@@ -155,7 +192,7 @@ static void draw_info(void)
 
 static int list_rows(void)
 {
-    return LINES - ROW_LIST - 3; /* 3 rows: sep + 2 help */
+    return LINES - ROW_LIST - 3;  /* bottom: sep + 2 help rows */
 }
 
 static void draw_presets(void)
@@ -164,23 +201,39 @@ static void draw_presets(void)
     int rows = list_rows();
     if (rows < 2) return;
 
+    /* Name column width: available space after the fixed prefix (19 chars at col 2) */
+    int name_w = COLS - 24;  /* 2 (margin) + 19 (prefix) + 2 (cur marker) + 1 */
+    if (name_w < 0)          name_w = 0;
+    if (name_w > NAME_MAX_LEN) name_w = NAME_MAX_LEN;
+
     if (mode == M_SCANNING) {
         pthread_mutex_lock(&radio.mutex);
         int      found = radio.found_count;
-        uint32_t freqs[256];
-        if (found > 0)
-            memcpy(freqs, radio.found_freqs, (size_t)found * sizeof(uint32_t));
+        uint32_t freqs[MAX_PRESETS];
+        char     names[MAX_PRESETS][NAME_MAX_LEN + 1];
+        if (found > 0) {
+            memcpy(freqs, radio.found_freqs,
+                   (size_t)found * sizeof(uint32_t));
+            memcpy(names, radio.found_names,
+                   (size_t)found * sizeof(names[0]));
+        }
         pthread_mutex_unlock(&radio.mutex);
 
         attron(A_BOLD);
         mvprintw(top, 2, "Stations found so far:");
         attroff(A_BOLD);
-        for (int i = 0; i < found && i < rows - 1; i++)
-            mvprintw(top + 1 + i, 4, "%2d.  %6.2f MHz", i + 1, freqs[i] / 1000000.0);
+        for (int i = 0; i < found && i < rows - 1; i++) {
+            if (names[i][0])
+                mvprintw(top + 1 + i, 4, "%2d.  %6.2f MHz  %s",
+                         i + 1, freqs[i] / 1000000.0, names[i]);
+            else
+                mvprintw(top + 1 + i, 4, "%2d.  %6.2f MHz",
+                         i + 1, freqs[i] / 1000000.0);
+        }
         return;
     }
 
-    /* Normal / tuning mode */
+    /* Normal / tuning / editing */
     int count = config.count;
     attron(A_BOLD);
     mvprintw(top, 2, "Presets (%d):", count);
@@ -188,7 +241,8 @@ static void draw_presets(void)
 
     if (count == 0) {
         attron(A_DIM);
-        mvprintw(top + 1, 4, "(none — press 's' to scan or 'a' to add current frequency)");
+        mvprintw(top + 1, 4,
+                 "(none — press 's' to scan or 'a' to add current frequency)");
         attroff(A_DIM);
         return;
     }
@@ -197,29 +251,30 @@ static void draw_presets(void)
     if (preset_sel >= count) preset_sel = count - 1;
     if (preset_sel < 0)      preset_sel = 0;
 
-    /* Scroll so selected is visible (account for header row) */
+    /* Scroll so selected item is visible */
     int vis = rows - 1;
-    if (preset_sel < list_offset)          list_offset = preset_sel;
-    if (preset_sel >= list_offset + vis)   list_offset = preset_sel - vis + 1;
+    if (preset_sel < list_offset)        list_offset = preset_sel;
+    if (preset_sel >= list_offset + vis) list_offset = preset_sel - vis + 1;
 
     for (int i = 0; i < vis && list_offset + i < count; i++) {
         int idx    = list_offset + i;
         int is_sel = (idx == preset_sel);
         int is_cur = (config.freqs[idx] == radio.freq_hz);
 
-        if (is_sel) attron(COLOR_PAIR(CP_SEL) | A_BOLD);
-        else if (is_cur) attron(COLOR_PAIR(CP_CUR));
+        if (is_sel)       attron(COLOR_PAIR(CP_SEL) | A_BOLD);
+        else if (is_cur)  attron(COLOR_PAIR(CP_CUR));
 
-        mvprintw(top + 1 + i, 2, "%c %2d.  %6.2f MHz  %s",
+        mvprintw(top + 1 + i, 2, "%c %2d.  %6.2f MHz  %-*.*s%s",
                  is_sel ? '>' : ' ',
                  idx + 1,
                  config.freqs[idx] / 1000000.0,
-                 is_cur ? "<" : " ");
-
+                 name_w, name_w,
+                 config.names[idx],
+                 is_cur ? " <" : "  ");
         clrtoeol();
 
-        if (is_sel) attroff(COLOR_PAIR(CP_SEL) | A_BOLD);
-        else if (is_cur) attroff(COLOR_PAIR(CP_CUR));
+        if (is_sel)       attroff(COLOR_PAIR(CP_SEL) | A_BOLD);
+        else if (is_cur)  attroff(COLOR_PAIR(CP_CUR));
     }
 }
 
@@ -228,13 +283,24 @@ static void draw_help(void)
     int y = LINES - 3;
     move(y, 0); hline(ACS_HLINE, COLS);
     attron(A_DIM);
-    if (mode == M_SCANNING) {
-        mvprintw(y + 1, 2, "s/q:stop scan & save");
-    } else if (mode == M_TUNING) {
+    switch (mode) {
+    case M_SCANNING:
+        mvprintw(y + 1, 2, "s/Esc:stop scan & save   q:stop & quit");
+        break;
+    case M_TUNING:
         mvprintw(y + 1, 2, "0-9 .:enter MHz   Enter:tune   Esc:cancel");
-    } else {
-        mvprintw(y + 1, 2, "s:scan  ,:seek<  .:seek>  t:tune  m:mute  +/-:vol  a:add  d:del");
-        mvprintw(y + 2, 2, "Up/Dn:select preset   Enter:tune to preset   q:quit");
+        break;
+    case M_EDITING:
+        mvprintw(y + 1, 2,
+                 "Type name (max %d chars)   Enter:save   Esc:cancel   Bksp:delete",
+                 NAME_MAX_LEN);
+        break;
+    case M_NORMAL:
+        mvprintw(y + 1, 2,
+                 "s:scan  ,:seek<  .:seek>  t:tune  m:mute  +/-:vol  a:add  d:del  e:rename");
+        mvprintw(y + 2, 2,
+                 "Up/Dn:select   Enter:tune to preset   q:quit");
+        break;
     }
     attroff(A_DIM);
 }
@@ -253,30 +319,36 @@ static void draw_all(void)
 
 /* ── scan completion ─────────────────────────────────────────────────── */
 
-static void finish_scan(int aborted)
+static void finish_scan(int quit_after)
 {
-    (void)aborted;
-    radio_stop_scan(&radio); /* joins thread; safe even if already done */
+    radio_stop_scan(&radio);  /* joins thread; safe if already done */
 
     pthread_mutex_lock(&radio.mutex);
     int found = radio.found_count;
     config.count = 0;
-    for (int i = 0; i < found && i < MAX_PRESETS; i++)
-        config.freqs[config.count++] = radio.found_freqs[i];
+    for (int i = 0; i < found && i < MAX_PRESETS; i++) {
+        config.freqs[config.count] = radio.found_freqs[i];
+        strncpy(config.names[config.count], radio.found_names[i], NAME_MAX_LEN);
+        config.names[config.count][NAME_MAX_LEN] = '\0';
+        config.count++;
+    }
     pthread_mutex_unlock(&radio.mutex);
 
     config_save(&config);
-    radio_set_freq(&radio, radio.freq_hz); /* restore pre-scan frequency */
+    radio_set_freq(&radio, radio.freq_hz);  /* restore pre-scan frequency */
     mode = M_NORMAL;
     preset_sel = 0;
 
-    char msg[80];
-    snprintf(msg, sizeof(msg), "Scan done — found %d station%s, saved to ~/.ncradio.conf",
+    char msg[96];
+    snprintf(msg, sizeof(msg),
+             "Scan done — found %d station%s, saved to ~/.ncradio.conf",
              config.count, config.count == 1 ? "" : "s");
     set_msg(msg);
+
+    if (quit_after) running = 0;
 }
 
-/* ── input handling ──────────────────────────────────────────────────── */
+/* ── input ───────────────────────────────────────────────────────────── */
 
 static void handle_key(int ch)
 {
@@ -295,7 +367,7 @@ static void handle_key(int ch)
             }
             mode = M_NORMAL;
             tune_len = 0; tune_buf[0] = '\0';
-        } else if (ch == 27 /* ESC */) {
+        } else if (ch == 27) {
             mode = M_NORMAL;
             tune_len = 0; tune_buf[0] = '\0';
         } else if ((ch == KEY_BACKSPACE || ch == 127 || ch == '\b') && tune_len > 0) {
@@ -306,11 +378,27 @@ static void handle_key(int ch)
         }
         break;
 
-    case M_SCANNING:
-        if (ch == 's' || ch == 'q' || ch == 27) {
-            finish_scan(1);
-            if (ch == 'q') running = 0;
+    case M_EDITING:
+        if (ch == '\n' || ch == KEY_ENTER) {
+            if (preset_sel >= 0 && preset_sel < config.count) {
+                memcpy(config.names[preset_sel], edit_buf, NAME_MAX_LEN + 1);
+                config_save(&config);
+                set_msg("Name saved.");
+            }
+            mode = M_NORMAL;
+        } else if (ch == 27) {
+            mode = M_NORMAL;
+        } else if ((ch == KEY_BACKSPACE || ch == 127 || ch == '\b') && edit_len > 0) {
+            edit_buf[--edit_len] = '\0';
+        } else if (isprint(ch) && edit_len < NAME_MAX_LEN) {
+            edit_buf[edit_len++] = (char)ch;
+            edit_buf[edit_len]   = '\0';
         }
+        break;
+
+    case M_SCANNING:
+        if (ch == 's' || ch == 27) finish_scan(0);
+        else if (ch == 'q')        finish_scan(1);
         break;
 
     case M_NORMAL:
@@ -352,7 +440,7 @@ static void handle_key(int ch)
 
         case 'a': {
             int prev = config.count;
-            config_add(&config, radio.freq_hz);
+            config_add(&config, radio.freq_hz, "");
             if (config.count > prev) {
                 config_save(&config);
                 for (int i = 0; i < config.count; i++)
@@ -374,6 +462,15 @@ static void handle_key(int ch)
             }
             break;
 
+        case 'e':
+            if (preset_sel >= 0 && preset_sel < config.count) {
+                strncpy(edit_buf, config.names[preset_sel], NAME_MAX_LEN);
+                edit_buf[NAME_MAX_LEN] = '\0';
+                edit_len = (int)strlen(edit_buf);
+                mode = M_EDITING;
+            }
+            break;
+
         case KEY_UP:
             if (preset_sel > 0) preset_sel--;
             break;
@@ -388,11 +485,11 @@ static void handle_key(int ch)
             }
             break;
 
-        case KEY_PPAGE: /* Page Up */
+        case KEY_PPAGE:
             preset_sel -= list_rows() - 2;
             if (preset_sel < 0) preset_sel = 0;
             break;
-        case KEY_NPAGE: /* Page Down */
+        case KEY_NPAGE:
             preset_sel += list_rows() - 2;
             if (preset_sel >= config.count) preset_sel = config.count - 1;
             break;
@@ -403,11 +500,7 @@ static void handle_key(int ch)
 
 /* ── signal handler ──────────────────────────────────────────────────── */
 
-static void on_signal(int sig)
-{
-    (void)sig;
-    running = 0;
-}
+static void on_signal(int sig) { (void)sig; running = 0; }
 
 /* ── main ────────────────────────────────────────────────────────────── */
 
@@ -432,20 +525,19 @@ int main(int argc, char *argv[])
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
-    timeout(250); /* non-blocking getch, 250 ms tick */
+    timeout(250);
 
     if (has_colors()) {
         start_color();
         use_default_colors();
-        init_pair(CP_TITLE,   COLOR_CYAN,    -1);
-        init_pair(CP_SEL,     COLOR_BLACK,   COLOR_CYAN);
-        init_pair(CP_SIG_LO,  COLOR_RED,     -1);
-        init_pair(CP_SIG_MED, COLOR_YELLOW,  -1);
-        init_pair(CP_SIG_HI,  COLOR_GREEN,   -1);
-        init_pair(CP_VOL,     COLOR_CYAN,    -1);
-        init_pair(CP_SCAN,    COLOR_YELLOW,  -1);
-        init_pair(CP_CUR,     COLOR_GREEN,   -1);
-        init_pair(CP_DIM,     COLOR_WHITE,   -1);
+        init_pair(CP_TITLE,   COLOR_CYAN,   -1);
+        init_pair(CP_SEL,     COLOR_BLACK,  COLOR_CYAN);
+        init_pair(CP_SIG_LO,  COLOR_RED,    -1);
+        init_pair(CP_SIG_MED, COLOR_YELLOW, -1);
+        init_pair(CP_SIG_HI,  COLOR_GREEN,  -1);
+        init_pair(CP_VOL,     COLOR_CYAN,   -1);
+        init_pair(CP_SCAN,    COLOR_YELLOW, -1);
+        init_pair(CP_CUR,     COLOR_GREEN,  -1);
     }
 
     signal_pct = radio_get_signal(&radio);
@@ -453,22 +545,22 @@ int main(int argc, char *argv[])
     struct timeval last_sig = {0, 0};
 
     while (running) {
-        /* Refresh signal strength every 500 ms in normal mode */
-        if (mode == M_NORMAL) {
+        /* Update signal + stereo every 500 ms */
+        if (mode == M_NORMAL || mode == M_EDITING || mode == M_TUNING) {
             struct timeval now;
             gettimeofday(&now, NULL);
             long ms = (now.tv_sec  - last_sig.tv_sec)  * 1000
                     + (now.tv_usec - last_sig.tv_usec) / 1000;
             if (ms >= 500) {
                 signal_pct = radio_get_signal(&radio);
+                radio_read_rds(&radio);
                 last_sig = now;
             }
         }
 
         /* Detect natural scan completion */
-        if (mode == M_SCANNING && !radio.scanning && radio.scan_started) {
+        if (mode == M_SCANNING && !radio.scanning && radio.scan_started)
             finish_scan(0);
-        }
 
         draw_all();
 
@@ -476,10 +568,8 @@ int main(int argc, char *argv[])
         if (ch != ERR) handle_key(ch);
     }
 
-    /* If we quit during scan, clean up gracefully */
-    if (mode == M_SCANNING) {
-        finish_scan(1);
-    }
+    if (mode == M_SCANNING)
+        finish_scan(0);
 
     endwin();
     radio_close(&radio);

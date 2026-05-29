@@ -1,6 +1,7 @@
 #include "radio.h"
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
@@ -9,7 +10,6 @@
 
 static uint32_t hz_to_v4l2(const Radio *r, uint32_t hz)
 {
-    /* V4L2 freq unit is 62.5 Hz (cap_low=1) or 62.5 kHz (cap_low=0) */
     return r->cap_low ? (uint32_t)(hz / 62.5) : hz / 62500;
 }
 
@@ -24,17 +24,62 @@ static void msleep(int ms)
     nanosleep(&ts, NULL);
 }
 
+/* Drain pending RDS blocks from fd into decoder d; called from both
+   the main thread (radio_read_rds) and the scan thread (collect_rds). */
+static void drain_rds(int fd, RdsDecoder *d)
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN)) return;
+
+    struct v4l2_rds_data buf[64];
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n <= 0) return;
+
+    int nb = (int)(n / (ssize_t)sizeof(struct v4l2_rds_data));
+    for (int i = 0; i < nb; i++)
+        rds_feed(d, buf[i].lsb, buf[i].msb, buf[i].block);
+}
+
+/* Collect RDS for up to `ms` ms or until PS name is ready.
+   Checks r->scanning each tick to allow scan abort. */
+static void collect_rds(Radio *r, RdsDecoder *d, int ms)
+{
+    int ticks = ms / 50;
+    for (int t = 0; t < ticks && r->scanning && !d->ps_ready; t++) {
+        struct pollfd pfd = { .fd = r->fd, .events = POLLIN };
+        int ret = poll(&pfd, 1, 50);
+        if (ret > 0 && (pfd.revents & POLLIN)) {
+            struct v4l2_rds_data buf[32];
+            ssize_t n = read(r->fd, buf, sizeof(buf));
+            if (n > 0) {
+                int nb = (int)(n / (ssize_t)sizeof(struct v4l2_rds_data));
+                for (int i = 0; i < nb; i++)
+                    rds_feed(d, buf[i].lsb, buf[i].msb, buf[i].block);
+            }
+        }
+    }
+}
+
 int radio_open(Radio *r, const char *device)
 {
     memset(r, 0, sizeof(*r));
     pthread_mutex_init(&r->mutex, NULL);
+    rds_init(&r->rds);
 
     r->fd = open(device, O_RDWR);
     if (r->fd < 0) return -1;
 
     struct v4l2_tuner tuner = { .index = 0 };
-    if (ioctl(r->fd, VIDIOC_G_TUNER, &tuner) == 0)
-        r->cap_low = !!(tuner.capability & V4L2_TUNER_CAP_LOW);
+    if (ioctl(r->fd, VIDIOC_G_TUNER, &tuner) == 0) {
+        r->cap_low     = !!(tuner.capability & V4L2_TUNER_CAP_LOW);
+        r->rds_capable = !!(tuner.capability & V4L2_TUNER_CAP_RDS);
+    }
+
+    if (r->rds_capable) {
+        /* Enable RDS reception (not all drivers need this; ignore errors) */
+        struct v4l2_control ctrl = { .id = V4L2_CID_RDS_RECEPTION, .value = 1 };
+        ioctl(r->fd, VIDIOC_S_CTRL, &ctrl);
+    }
 
     r->freq_hz = radio_get_freq(r);
     if (r->freq_hz < FREQ_MIN_HZ || r->freq_hz > FREQ_MAX_HZ)
@@ -62,6 +107,7 @@ int radio_set_freq(Radio *r, uint32_t hz)
     };
     if (ioctl(r->fd, VIDIOC_S_FREQUENCY, &vf) < 0) return -1;
     r->freq_hz = hz;
+    rds_init(&r->rds);  /* frequency changed — old RDS is stale */
     return 0;
 }
 
@@ -76,6 +122,7 @@ int radio_get_signal(Radio *r)
 {
     struct v4l2_tuner t = { .index = 0 };
     if (ioctl(r->fd, VIDIOC_G_TUNER, &t) < 0) return 0;
+    r->stereo = !!(t.rxsubchans & V4L2_TUNER_SUB_STEREO);
     return (int)((t.signal * 100ULL) / 65535);
 }
 
@@ -108,7 +155,14 @@ int radio_seek(Radio *r, int fwd)
     };
     if (ioctl(r->fd, VIDIOC_S_HW_FREQ_SEEK, &seek) < 0) return -1;
     r->freq_hz = radio_get_freq(r);
+    rds_init(&r->rds);  /* new station — reset RDS */
     return 0;
+}
+
+void radio_read_rds(Radio *r)
+{
+    if (!r->rds_capable) return;
+    drain_rds(r->fd, &r->rds);
 }
 
 static void *scan_fn(void *arg)
@@ -136,16 +190,37 @@ static void *scan_fn(void *arg)
         struct v4l2_tuner t = { .index = 0 };
         ioctl(r->fd, VIDIOC_G_TUNER, &t);
 
-        if (t.signal >= SCAN_SIGNAL_THRESH) {
-            pthread_mutex_lock(&r->mutex);
-            if (r->found_count < 256)
-                r->found_freqs[r->found_count++] = f;
-            pthread_mutex_unlock(&r->mutex);
-            msleep(200); /* brief dwell on found station */
+        if (t.signal < SCAN_SIGNAL_THRESH) continue;
+
+        /* Add station to list immediately so the UI shows it */
+        int idx = -1;
+        pthread_mutex_lock(&r->mutex);
+        if (r->found_count < MAX_PRESETS) {
+            idx = r->found_count++;
+            r->found_freqs[idx] = f;
+            r->found_names[idx][0] = '\0';
+        }
+        pthread_mutex_unlock(&r->mutex);
+
+        if (idx < 0) continue;
+
+        if (r->rds_capable) {
+            /* Try to get RDS station name for up to 1.5 s */
+            RdsDecoder local;
+            rds_init(&local);
+            collect_rds(r, &local, 1500);
+            if (local.ps_ready) {
+                pthread_mutex_lock(&r->mutex);
+                strncpy(r->found_names[idx], local.ps, NAME_MAX_LEN);
+                r->found_names[idx][NAME_MAX_LEN] = '\0';
+                pthread_mutex_unlock(&r->mutex);
+            }
+        } else {
+            msleep(200);
         }
     }
 
-    r->scanning = 0; /* signal natural completion */
+    r->scanning = 0;  /* signal natural completion */
     return NULL;
 }
 
@@ -160,7 +235,7 @@ void radio_start_scan(Radio *r)
 void radio_stop_scan(Radio *r)
 {
     if (!r->scan_started) return;
-    r->scanning = 0;           /* request abort if still running */
+    r->scanning = 0;
     pthread_join(r->scan_thread, NULL);
     r->scan_started = 0;
 }
