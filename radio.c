@@ -24,8 +24,6 @@ static void msleep(int ms)
     nanosleep(&ts, NULL);
 }
 
-/* Drain pending RDS blocks from fd into decoder d; called from both
-   the main thread (radio_read_rds) and the scan thread (collect_rds). */
 static void drain_rds(int fd, RdsDecoder *d)
 {
     struct pollfd pfd = { .fd = fd, .events = POLLIN };
@@ -40,8 +38,8 @@ static void drain_rds(int fd, RdsDecoder *d)
         rds_feed(d, buf[i].lsb, buf[i].msb, buf[i].block);
 }
 
-/* Collect RDS for up to `ms` ms or until PS name is ready.
-   Checks r->scanning each tick to allow scan abort. */
+/* Poll and feed RDS for up to `ms` ms or until PS name is ready.
+   Checks r->scanning each loop iteration to support scan abort. */
 static void collect_rds(Radio *r, RdsDecoder *d, int ms)
 {
     int ticks = ms / 50;
@@ -76,7 +74,6 @@ int radio_open(Radio *r, const char *device)
     }
 
     if (r->rds_capable) {
-        /* Enable RDS reception (not all drivers need this; ignore errors) */
         struct v4l2_control ctrl = { .id = V4L2_CID_RDS_RECEPTION, .value = 1 };
         ioctl(r->fd, VIDIOC_S_CTRL, &ctrl);
     }
@@ -107,7 +104,7 @@ int radio_set_freq(Radio *r, uint32_t hz)
     };
     if (ioctl(r->fd, VIDIOC_S_FREQUENCY, &vf) < 0) return -1;
     r->freq_hz = hz;
-    rds_init(&r->rds);  /* frequency changed — old RDS is stale */
+    rds_init(&r->rds);
     return 0;
 }
 
@@ -155,7 +152,7 @@ int radio_seek(Radio *r, int fwd)
     };
     if (ioctl(r->fd, VIDIOC_S_HW_FREQ_SEEK, &seek) < 0) return -1;
     r->freq_hz = radio_get_freq(r);
-    rds_init(&r->rds);  /* new station — reset RDS */
+    rds_init(&r->rds);
     return 0;
 }
 
@@ -169,11 +166,16 @@ static void *scan_fn(void *arg)
 {
     Radio *r = arg;
 
+    /* Resolve effective scan parameters (fallback to compiled defaults) */
+    uint32_t step      = r->scan_step_hz  > 0 ? r->scan_step_hz  : FREQ_STEP_HZ;
+    int      threshold = r->scan_threshold > 0 ? r->scan_threshold : SCAN_SIGNAL_THRESH;
+    int      use_rds   = r->scan_rds_names;
+
     pthread_mutex_lock(&r->mutex);
     r->found_count = 0;
     pthread_mutex_unlock(&r->mutex);
 
-    for (uint32_t f = FREQ_MIN_HZ; f <= FREQ_MAX_HZ && r->scanning; f += FREQ_STEP_HZ) {
+    for (uint32_t f = FREQ_MIN_HZ; f <= FREQ_MAX_HZ && r->scanning; f += step) {
         pthread_mutex_lock(&r->mutex);
         r->scan_pos_hz = f;
         pthread_mutex_unlock(&r->mutex);
@@ -190,9 +192,9 @@ static void *scan_fn(void *arg)
         struct v4l2_tuner t = { .index = 0 };
         ioctl(r->fd, VIDIOC_G_TUNER, &t);
 
-        if (t.signal < SCAN_SIGNAL_THRESH) continue;
+        if ((int)t.signal < threshold) continue;
 
-        /* Add station to list immediately so the UI shows it */
+        /* Add station to found list immediately so the UI can show it */
         int idx = -1;
         pthread_mutex_lock(&r->mutex);
         if (r->found_count < MAX_PRESETS) {
@@ -204,8 +206,7 @@ static void *scan_fn(void *arg)
 
         if (idx < 0) continue;
 
-        if (r->rds_capable) {
-            /* Try to get RDS station name for up to 1.5 s */
+        if (r->rds_capable && use_rds) {
             RdsDecoder local;
             rds_init(&local);
             collect_rds(r, &local, 1500);
@@ -220,7 +221,7 @@ static void *scan_fn(void *arg)
         }
     }
 
-    r->scanning = 0;  /* signal natural completion */
+    r->scanning = 0;
     return NULL;
 }
 
