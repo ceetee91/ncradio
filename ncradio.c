@@ -236,9 +236,9 @@ static void draw_info(void)
         int      found = radio.found_count;
         pthread_mutex_unlock(&radio.mutex);
 
-        int pct = (FREQ_MAX_HZ == FREQ_MIN_HZ) ? 0 :
-                  (int)((double)(pos - FREQ_MIN_HZ) * 100.0 /
-                        (FREQ_MAX_HZ - FREQ_MIN_HZ));
+        int pct = (radio.freq_max_hz == radio.freq_min_hz) ? 0 :
+                  (int)((double)(pos - radio.freq_min_hz) * 100.0 /
+                        (radio.freq_max_hz - radio.freq_min_hz));
 
         attron(COLOR_PAIR(CP_SCAN) | A_BOLD);
         mvprintw(ROW_INFO, 2, "Scanning %6.2f MHz  Found: %d  [",

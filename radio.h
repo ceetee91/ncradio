@@ -15,6 +15,8 @@ typedef struct {
     int cap_low;        /* V4L2 freq unit: 1=62.5 Hz, 0=62.5 kHz */
     int rds_capable;    /* hardware supports RDS */
     int stereo;         /* 1 if currently receiving stereo */
+    uint32_t freq_min_hz;  /* device-reported tunable range (from VIDIOC_G_TUNER) */
+    uint32_t freq_max_hz;
     uint32_t freq_hz;   /* current tuned frequency in Hz (pre-scan during scan) */
     int volume;         /* 0-100 */
     int muted;

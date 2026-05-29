@@ -67,10 +67,17 @@ int radio_open(Radio *r, const char *device)
     r->fd = open(device, O_RDWR);
     if (r->fd < 0) return -1;
 
+    r->freq_min_hz = FREQ_MIN_HZ;
+    r->freq_max_hz = FREQ_MAX_HZ;
+
     struct v4l2_tuner tuner = { .index = 0 };
     if (ioctl(r->fd, VIDIOC_G_TUNER, &tuner) == 0) {
         r->cap_low     = !!(tuner.capability & V4L2_TUNER_CAP_LOW);
         r->rds_capable = !!(tuner.capability & V4L2_TUNER_CAP_RDS);
+        if (tuner.rangelow && tuner.rangehigh) {
+            r->freq_min_hz = v4l2_to_hz(r, tuner.rangelow);
+            r->freq_max_hz = v4l2_to_hz(r, tuner.rangehigh);
+        }
     }
 
     if (r->rds_capable) {
@@ -84,8 +91,8 @@ int radio_open(Radio *r, const char *device)
         memset(&r->volume_ctrl, 0, sizeof(r->volume_ctrl));
 
     r->freq_hz = radio_get_freq(r);
-    if (r->freq_hz < FREQ_MIN_HZ || r->freq_hz > FREQ_MAX_HZ)
-        r->freq_hz = 98500000;
+    if (r->freq_hz < r->freq_min_hz || r->freq_hz > r->freq_max_hz)
+        r->freq_hz = r->freq_min_hz + (r->freq_max_hz - r->freq_min_hz) / 2;
 
     r->volume = 80;
     radio_set_volume(r, r->volume);
@@ -101,8 +108,8 @@ void radio_close(Radio *r)
 
 int radio_set_freq(Radio *r, uint32_t hz)
 {
-    if (hz < FREQ_MIN_HZ) hz = FREQ_MIN_HZ;
-    if (hz > FREQ_MAX_HZ) hz = FREQ_MAX_HZ;
+    if (hz < r->freq_min_hz) hz = r->freq_min_hz;
+    if (hz > r->freq_max_hz) hz = r->freq_max_hz;
     struct v4l2_frequency vf = {
         .tuner = 0, .type = V4L2_TUNER_RADIO,
         .frequency = hz_to_v4l2(r, hz)
@@ -180,15 +187,15 @@ static void *seek_fn(void *arg)
     r->seek_result_hz = 0;
 
     /* Maximum steps for a full sweep of the FM band */
-    int max_steps = (int)((FREQ_MAX_HZ - FREQ_MIN_HZ) / step) + 2;
+    int max_steps = (int)((r->freq_max_hz - r->freq_min_hz) / step) + 2;
     uint32_t f = r->freq_hz;
 
     for (int s = 0; s < max_steps && r->seeking; s++) {
         /* Advance first so we don't re-check the current frequency */
         if (fwd)
-            f = (f + step > FREQ_MAX_HZ) ? FREQ_MIN_HZ : f + step;
+            f = (f + step > r->freq_max_hz) ? r->freq_min_hz : f + step;
         else
-            f = (f < FREQ_MIN_HZ + step) ? FREQ_MAX_HZ : f - step;
+            f = (f < r->freq_min_hz + step) ? r->freq_max_hz : f - step;
 
         struct v4l2_frequency vf = {
             .tuner = 0, .type = V4L2_TUNER_RADIO,
@@ -245,7 +252,7 @@ static void *scan_fn(void *arg)
     r->found_count = 0;
     pthread_mutex_unlock(&r->mutex);
 
-    for (uint32_t f = FREQ_MIN_HZ; f <= FREQ_MAX_HZ && r->scanning; f += step) {
+    for (uint32_t f = r->freq_min_hz; f <= r->freq_max_hz && r->scanning; f += step) {
         pthread_mutex_lock(&r->mutex);
         r->scan_pos_hz = f;
         pthread_mutex_unlock(&r->mutex);
