@@ -20,8 +20,10 @@ static void settings_defaults(Config *c)
         c->scan_step_hz = DEFAULT_SCAN_STEP_HZ;
     if (c->signal_threshold_pct < 5 || c->signal_threshold_pct > 95)
         c->signal_threshold_pct = DEFAULT_SIGNAL_THRESH_PCT;
-    c->rds_names    = c->rds_names    ? 1 : 0;
-    c->audio_enabled = c->audio_enabled ? 1 : 0;
+    c->rds_names       = c->rds_names       ? 1 : 0;
+    c->audio_enabled   = c->audio_enabled   ? 1 : 0;
+    c->audio_mute_scan = c->audio_mute_scan ? 1 : 0;
+    c->audio_mute_seek = c->audio_mute_seek ? 1 : 0;
 }
 
 int config_load(Config *c)
@@ -31,6 +33,8 @@ int config_load(Config *c)
     c->signal_threshold_pct = DEFAULT_SIGNAL_THRESH_PCT;
     c->rds_names            = DEFAULT_RDS_NAMES;
     c->audio_enabled        = DEFAULT_AUDIO_ENABLED;
+    c->audio_mute_scan      = DEFAULT_AUDIO_MUTE_SCAN;
+    c->audio_mute_seek      = DEFAULT_AUDIO_MUTE_SEEK;
 
     FILE *f = fopen(path(), "r");
     if (!f) return 0;
@@ -50,6 +54,8 @@ int config_load(Config *c)
             else if (strcmp(key, "signal_threshold")  == 0) c->signal_threshold_pct = ival;
             else if (strcmp(key, "rds_names")         == 0) c->rds_names = ival ? 1 : 0;
             else if (strcmp(key, "audio_enabled")     == 0) c->audio_enabled = ival ? 1 : 0;
+            else if (strcmp(key, "audio_mute_scan")   == 0) c->audio_mute_scan = ival ? 1 : 0;
+            else if (strcmp(key, "audio_mute_seek")   == 0) c->audio_mute_seek = ival ? 1 : 0;
             else if (strcmp(key, "audio_device")      == 0) {
                 strncpy(c->audio_device, sval, sizeof(c->audio_device) - 1);
                 c->audio_device[sizeof(c->audio_device) - 1] = '\0';
@@ -91,6 +97,8 @@ int config_save(const Config *c)
     fprintf(f, "signal_threshold=%d\n", c->signal_threshold_pct);
     fprintf(f, "rds_names=%d\n",        c->rds_names);
     fprintf(f, "audio_enabled=%d\n",    c->audio_enabled);
+    fprintf(f, "audio_mute_scan=%d\n", c->audio_mute_scan);
+    fprintf(f, "audio_mute_seek=%d\n", c->audio_mute_seek);
     if (c->audio_device[0])
         fprintf(f, "audio_device=%s\n", c->audio_device);
     fprintf(f, "# stations\n");

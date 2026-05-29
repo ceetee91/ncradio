@@ -63,11 +63,13 @@ static int settings_sel = 0;
 #define SETTING_THRESHOLD    1
 #define SETTING_RDS_NAMES    2
 #ifdef HAVE_AUDIO
-#define SETTING_AUDIO_ENABLE 3
-#define SETTING_AUDIO_DEV    4
-#define SETTING_COUNT        5
+#define SETTING_AUDIO_ENABLE    3
+#define SETTING_AUDIO_DEV       4
+#define SETTING_AUDIO_MUTE_SCAN 5
+#define SETTING_AUDIO_MUTE_SEEK 6
+#define SETTING_COUNT           7
 #else
-#define SETTING_COUNT        3
+#define SETTING_COUNT           3
 #endif
 
 #ifdef HAVE_AUDIO
@@ -284,6 +286,8 @@ static void draw_settings(void)
 #ifdef HAVE_AUDIO
         "Audio output:",
         "Audio device:",
+        "Mute while scanning:",
+        "Mute while seeking:",
 #endif
     };
     static const char *base_hints[SETTING_COUNT] = {
@@ -293,6 +297,8 @@ static void draw_settings(void)
 #ifdef HAVE_AUDIO
         "<- -> or Enter to toggle",
         "<- -> to cycle",
+        "<- -> or Enter to toggle",
+        "<- -> or Enter to toggle",
 #endif
     };
 
@@ -330,6 +336,14 @@ static void draw_settings(void)
                 snprintf(valstr, sizeof(valstr), "(auto)");
             else
                 snprintf(valstr, sizeof(valstr), "(none detected)");
+            break;
+        case SETTING_AUDIO_MUTE_SCAN:
+            snprintf(valstr, sizeof(valstr), "%s",
+                     config.audio_mute_scan ? "Yes" : "No");
+            break;
+        case SETTING_AUDIO_MUTE_SEEK:
+            snprintf(valstr, sizeof(valstr), "%s",
+                     config.audio_mute_seek ? "Yes" : "No");
             break;
 #endif
         }
@@ -586,6 +600,9 @@ static void finish_scan(int quit_after)
     mode = M_NORMAL;
     preset_sel  = 0;
     list_offset = 0;
+#ifdef HAVE_AUDIO
+    if (config.audio_mute_scan) audio_apply();
+#endif
 
     char msg[96];
     snprintf(msg, sizeof(msg),
@@ -642,6 +659,12 @@ static void handle_settings_key(int ch)
                     audio_start(&audio, config.audio_device);
                 config_save(&config);
             }
+        } else if (settings_sel == SETTING_AUDIO_MUTE_SCAN) {
+            config.audio_mute_scan = !config.audio_mute_scan;
+            config_save(&config);
+        } else if (settings_sel == SETTING_AUDIO_MUTE_SEEK) {
+            config.audio_mute_seek = !config.audio_mute_seek;
+            config_save(&config);
 #endif
         }
         break;
@@ -655,6 +678,12 @@ static void handle_settings_key(int ch)
         } else if (settings_sel == SETTING_AUDIO_ENABLE) {
             config.audio_enabled = !config.audio_enabled;
             audio_apply();
+            config_save(&config);
+        } else if (settings_sel == SETTING_AUDIO_MUTE_SCAN) {
+            config.audio_mute_scan = !config.audio_mute_scan;
+            config_save(&config);
+        } else if (settings_sel == SETTING_AUDIO_MUTE_SEEK) {
+            config.audio_mute_seek = !config.audio_mute_seek;
             config_save(&config);
 #endif
         }
@@ -725,6 +754,9 @@ static void handle_key(int ch)
         radio_stop_seek(&radio);
         radio_set_freq(&radio, radio.freq_hz);
         mode = M_NORMAL;
+#ifdef HAVE_AUDIO
+        if (config.audio_mute_seek) audio_apply();
+#endif
         if (ch == 'q') running = 0;
         break;
 
@@ -745,6 +777,9 @@ static void handle_key(int ch)
             radio.scan_rds_names = config.rds_names;
             radio_start_scan(&radio);
             mode = M_SCANNING;
+#ifdef HAVE_AUDIO
+            if (config.audio_mute_scan) audio_stop(&audio);
+#endif
             break;
 
         /* Step frequency by the configured scan step */
@@ -774,6 +809,9 @@ static void handle_key(int ch)
                              config.scan_step_hz,
                              (config.signal_threshold_pct * 65535) / 100);
             mode = M_SEEKING;
+#ifdef HAVE_AUDIO
+            if (config.audio_mute_seek) audio_stop(&audio);
+#endif
             break;
 
         case '>':
@@ -781,6 +819,9 @@ static void handle_key(int ch)
                              config.scan_step_hz,
                              (config.signal_threshold_pct * 65535) / 100);
             mode = M_SEEKING;
+#ifdef HAVE_AUDIO
+            if (config.audio_mute_seek) audio_stop(&audio);
+#endif
             break;
 
         case 't':
@@ -950,6 +991,9 @@ int main(int argc, char *argv[])
                 set_msg("No station found.");
             }
             mode = M_NORMAL;
+#ifdef HAVE_AUDIO
+            if (config.audio_mute_seek) audio_apply();
+#endif
         }
 
         draw_all();

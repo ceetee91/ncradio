@@ -10,6 +10,8 @@
 #define DEFAULT_SIGNAL_THRESH_PCT       30
 #define DEFAULT_RDS_NAMES                1
 #define DEFAULT_AUDIO_ENABLED            0
+#define DEFAULT_AUDIO_MUTE_SCAN          1
+#define DEFAULT_AUDIO_MUTE_SEEK          1
 
 typedef struct {
     /* stations */
@@ -25,6 +27,8 @@ typedef struct {
     /* audio settings */
     int      audio_enabled;
     char     audio_device[64]; /* ALSA capture device, e.g. "hw:2,0" */
+    int      audio_mute_scan;  /* stop audio pipe while scanning */
+    int      audio_mute_seek;  /* stop audio pipe while seeking */
 } Config;
 
 int  config_load(Config *c);
