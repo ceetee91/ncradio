@@ -11,9 +11,9 @@ cards and USB radio sticks accessible as `/dev/radio0`.
  Coldplay - The Scientist                               ← RDS radio text
 ──────────────────────────────────────────────────────────────────
  Presets (9):
- > 1.  87.90 BBC R1      2.  91.30 Classic     3.  94.50 Radio 3
-   4.  98.50 Capital  <  5. 101.00              6. 103.60 LBC
-   7. 105.40              8. 107.30              9. 107.90
+ > 1.  87.90 BBC R1      4.  98.50 Capital  <  7. 105.40
+   2.  91.30 Classic     5. 101.00              8. 107.30
+   3.  94.50 Radio 3     6. 103.60 LBC          9. 107.90
 ──────────────────────────────────────────────────────────────────
  s:scan  ,:step<  .:step>  t:tune  m:mute  +/-:vol  a:add  d:del  e:rename  o:settings
  Up/Dn:select preset   Enter:tune to preset   q:quit
@@ -158,12 +158,16 @@ Presets are displayed in a multi-column grid that fills the terminal width
 automatically:
 
 - Frequencies are shown as `XX.XX` (no "MHz" label).
+- Presets are arranged **column-major**: the list fills downward within a
+  column before spilling into the next, like `ls` output. Preset 2 is below
+  preset 1, not next to it.
 - The number of columns is derived from the terminal width and the length of
   the longest preset name. More columns are used when names are absent or
-  short; fewer columns (with names visible) when names are longer.
+  short; fewer when names are longer.
 - The currently tuned preset is marked with `<`.
 - The selected (highlighted) preset is marked with `>`.
-- `↑`/`↓` move one preset at a time; `PgUp`/`PgDn` scroll by one visible page.
+- `↑`/`↓` move one preset at a time within the column; `PgUp`/`PgDn` scroll
+  by one visible window of rows.
 
 ## Settings
 

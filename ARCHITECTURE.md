@@ -207,15 +207,20 @@ Example at 80 columns:
 - 0 names → 5 columns, 15 chars each, no name field
 - max name 8 chars → 3 columns, 26 chars each, 8-char name visible
 
-`preset_ncols` is written by `draw_presets()` and read by `handle_key()` to
-compute the correct PgUp/PgDn page size.
+**Column-major ordering** — items fill downward within each column before
+spilling into the next, like `ls` output. Item `i` occupies visual row
+`i % rows_per_col` and column `i / rows_per_col`, where
+`rows_per_col = ceil(count / ncols)`. The last column may have fewer items
+than the others; those cells are simply left blank.
 
-**Row-based scrolling** — `list_offset` is a *row* offset (not an entry offset).
-The selected entry's row is `preset_sel / ncols`. The scroll invariant is:
+**Row-based scrolling** — `list_offset` is a *row* offset (not an entry
+offset). The selected entry's row is `preset_sel % rows_per_col`. The scroll
+invariant is:
 ```
 item_row ∈ [list_offset, list_offset + vis_rows)
 ```
-adjusted on every draw call.
+adjusted on every draw call. PgUp/PgDn move by `vis_rows` items (one
+visible window of rows), which scrolls down within the same column group.
 
 **Scan-list auto-scroll** — during M_SCANNING the visible window starts at
 `max(0, found_count - vis_rows)`, which always shows the most recently found

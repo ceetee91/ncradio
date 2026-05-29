@@ -368,18 +368,23 @@ static void draw_presets(void)
     if (preset_sel >= count) preset_sel = count - 1;
     if (preset_sel < 0)      preset_sel = 0;
 
-    /* Row-based scrolling: keep selected item's row in view */
-    int vis_rows = rows - 1;
-    int item_row = preset_sel / ncols;
+    /* Column-major layout: items fill downward within each column before
+       spilling into the next.  Item i sits at visual row (i % rows_per_col)
+       and column (i / rows_per_col). */
+    int rows_per_col = (count + ncols - 1) / ncols;
+    int vis_rows     = rows - 1;
+    int item_row     = preset_sel % rows_per_col;
+
     if (item_row < list_offset)               list_offset = item_row;
     if (item_row >= list_offset + vis_rows)   list_offset = item_row - vis_rows + 1;
     if (list_offset < 0) list_offset = 0;
 
     for (int r = 0; r < vis_rows; r++) {
         int data_row = list_offset + r;
+        if (data_row >= rows_per_col) break;
         for (int c = 0; c < ncols; c++) {
-            int idx = data_row * ncols + c;
-            if (idx >= count) break;
+            int idx = c * rows_per_col + data_row;
+            if (idx >= count) continue;  /* last column may be shorter */
 
             int is_sel = (idx == preset_sel);
             int is_cur = (config.freqs[idx] == radio.freq_hz);
@@ -683,14 +688,14 @@ static void handle_key(int ch)
             break;
 
         case KEY_PPAGE: {
-            int page = preset_ncols * (list_rows() - 1);
-            preset_sel -= page > 0 ? page : 1;
+            int vis = list_rows() - 1;
+            preset_sel -= vis > 0 ? vis : 1;
             if (preset_sel < 0) preset_sel = 0;
             break;
         }
         case KEY_NPAGE: {
-            int page = preset_ncols * (list_rows() - 1);
-            preset_sel += page > 0 ? page : 1;
+            int vis = list_rows() - 1;
+            preset_sel += vis > 0 ? vis : 1;
             if (preset_sel >= config.count) preset_sel = config.count - 1;
             break;
         }
