@@ -96,6 +96,7 @@ int radio_open(Radio *r, const char *device)
 
     r->volume = 80;
     radio_set_volume(r, r->volume);
+    radio_mute(r, 0);
     return 0;
 }
 
