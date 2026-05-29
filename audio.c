@@ -64,6 +64,11 @@ static void *audio_fn(void *arg)
     a->rate     = rate;
     a->channels = channels;
 
+    if (snd_pcm_prepare(cap) < 0 || snd_pcm_start(cap) < 0) {
+        snprintf(a->errmsg, sizeof(a->errmsg), "cannot start capture device");
+        goto done;
+    }
+
     /* Open and configure playback ("default" = PulseAudio/PipeWire/hw) */
     if (snd_pcm_open(&play, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) {
         snprintf(a->errmsg, sizeof(a->errmsg),
@@ -93,21 +98,11 @@ static void *audio_fn(void *arg)
         goto done;
     }
 
-    /* Main transfer loop */
+    /* Main transfer loop — snd_pcm_readi blocks for one period (~100 ms),
+       auto-starts capture after snd_pcm_recover, and checks running on wakeup. */
     while (a->running) {
-        /* Wait up to 100 ms so we check a->running frequently */
-        int ready = snd_pcm_wait(cap, 100);
-        if (!a->running) break;
-        if (ready < 0) {
-            if (snd_pcm_recover(cap, ready, 1) < 0) {
-                snprintf(a->errmsg, sizeof(a->errmsg), "capture error");
-                break;
-            }
-            continue;
-        }
-        if (ready == 0) continue; /* timeout — loop to re-check running */
-
         snd_pcm_sframes_t n = snd_pcm_readi(cap, buf, period);
+        if (!a->running) break;
         if (n < 0) {
             if (snd_pcm_recover(cap, (int)n, 1) < 0) {
                 snprintf(a->errmsg, sizeof(a->errmsg), "capture read error");
@@ -118,7 +113,7 @@ static void *audio_fn(void *arg)
 
         snd_pcm_sframes_t w = snd_pcm_writei(play, buf, (snd_pcm_uframes_t)n);
         if (w < 0)
-            snd_pcm_recover(play, (int)w, 1); /* underrun — drop and continue */
+            snd_pcm_recover(play, (int)w, 1);
     }
 
 done:
@@ -163,39 +158,41 @@ void audio_enum_devices(char names[][AUDIO_DEV_NAMELEN],
                         int *count, int max)
 {
     *count = 0;
-    void **hints = NULL;
-    if (snd_device_name_hint(-1, "pcm", &hints) < 0 || !hints) return;
+    int card = -1;
 
-    for (void **h = hints; *h && *count < max; h++) {
-        /* Only capture-capable devices */
-        char *ioid = snd_device_name_get_hint(*h, "IOID");
-        int is_input = !ioid || strcmp(ioid, "Input") == 0;
-        free(ioid);
-        if (!is_input) continue;
+    while (*count < max && snd_card_next(&card) >= 0 && card >= 0) {
+        char ctl_name[16];
+        snprintf(ctl_name, sizeof(ctl_name), "hw:%d", card);
 
-        char *name = snd_device_name_get_hint(*h, "NAME");
-        if (!name) continue;
+        snd_ctl_t *ctl;
+        if (snd_ctl_open(&ctl, ctl_name, 0) < 0) continue;
 
-        /* Only physical hw: devices, not virtual plugins */
-        if (strncmp(name, "hw:", 3) != 0) { free(name); continue; }
+        snd_ctl_card_info_t *ci;
+        snd_ctl_card_info_alloca(&ci);
+        if (snd_ctl_card_info(ctl, ci) < 0) { snd_ctl_close(ctl); continue; }
 
-        char *desc = snd_device_name_get_hint(*h, "DESC");
+        const char *card_id   = snd_ctl_card_info_get_id(ci);
+        const char *card_name = snd_ctl_card_info_get_name(ci);
 
-        strncpy(names[*count], name, AUDIO_DEV_NAMELEN - 1);
-        names[*count][AUDIO_DEV_NAMELEN - 1] = '\0';
+        int dev = -1;
+        while (*count < max && snd_ctl_pcm_next_device(ctl, &dev) >= 0 && dev >= 0) {
+            snd_pcm_info_t *pi;
+            snd_pcm_info_alloca(&pi);
+            snd_pcm_info_set_device(pi, (unsigned int)dev);
+            snd_pcm_info_set_subdevice(pi, 0);
+            snd_pcm_info_set_stream(pi, SND_PCM_STREAM_CAPTURE);
+            if (snd_ctl_pcm_info(ctl, pi) < 0) continue;
 
-        if (desc) {
-            /* Flatten multi-line descriptions */
-            for (char *p = desc; *p; p++) if (*p == '\n') *p = ' ';
-            strncpy(descs[*count], desc, AUDIO_DEV_DESCLEN - 1);
-            descs[*count][AUDIO_DEV_DESCLEN - 1] = '\0';
-            free(desc);
-        } else {
-            descs[*count][0] = '\0';
+            const char *dev_name = snd_pcm_info_get_name(pi);
+
+            snprintf(names[*count], AUDIO_DEV_NAMELEN,
+                     "hw:CARD=%s,DEV=%d", card_id, dev);
+
+            snprintf(descs[*count], AUDIO_DEV_DESCLEN,
+                     "%s, %s", card_name, dev_name ? dev_name : "");
+
+            (*count)++;
         }
-
-        free(name);
-        (*count)++;
+        snd_ctl_close(ctl);
     }
-    snd_device_name_free_hint(hints);
 }
