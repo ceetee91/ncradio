@@ -53,6 +53,7 @@ int config_load(Config *c)
             if      (strcmp(key, "scan_step")        == 0) c->scan_step_hz = (uint32_t)ival;
             else if (strcmp(key, "signal_threshold")  == 0) c->signal_threshold_pct = ival;
             else if (strcmp(key, "rds_names")         == 0) c->rds_names = ival ? 1 : 0;
+            else if (strcmp(key, "volume")            == 0) c->volume = ival;
             else if (strcmp(key, "audio_enabled")     == 0) c->audio_enabled = ival ? 1 : 0;
             else if (strcmp(key, "audio_mute_scan")   == 0) c->audio_mute_scan = ival ? 1 : 0;
             else if (strcmp(key, "audio_mute_seek")   == 0) c->audio_mute_seek = ival ? 1 : 0;
@@ -96,6 +97,7 @@ int config_save(const Config *c)
     fprintf(f, "scan_step=%u\n",        c->scan_step_hz);
     fprintf(f, "signal_threshold=%d\n", c->signal_threshold_pct);
     fprintf(f, "rds_names=%d\n",        c->rds_names);
+    fprintf(f, "volume=%d\n",           c->volume);
     fprintf(f, "audio_enabled=%d\n",    c->audio_enabled);
     fprintf(f, "audio_mute_scan=%d\n", c->audio_mute_scan);
     fprintf(f, "audio_mute_seek=%d\n", c->audio_mute_seek);

@@ -949,6 +949,8 @@ int main(int argc, char *argv[])
     }
 
     config_load(&config);
+    if (config.volume > 0)
+        radio_set_volume(&radio, config.volume);
 
 #ifdef HAVE_AUDIO
     /* Enumerate ALSA capture devices for the settings panel */
@@ -1025,6 +1027,9 @@ int main(int argc, char *argv[])
     }
 
     if (mode == M_SCANNING) finish_scan();
+
+    config.volume = radio.volume;
+    config_save(&config);
 
     endwin();
 #ifdef HAVE_AUDIO
