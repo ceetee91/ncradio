@@ -726,13 +726,19 @@ static void handle_key(int ch)
     case M_TUNING:
         if (ch == '\n' || ch == KEY_ENTER) {
             double mhz = 0;
+            double min_mhz = radio.freq_min_hz / 1000000.0;
+            double max_mhz = radio.freq_max_hz / 1000000.0;
             if (tune_len > 0 && sscanf(tune_buf, "%lf", &mhz) == 1 &&
-                mhz >= 87.5 && mhz <= 108.0) {
+                mhz >= min_mhz && mhz <= max_mhz) {
                 radio_set_freq(&radio, (uint32_t)(mhz * 1000000.0 + 0.5));
                 signal_pct = radio_get_signal(&radio);
                 set_msg("Tuned.");
             } else if (tune_len > 0) {
-                set_msg("Invalid frequency — enter 87.50 to 108.00");
+                char errmsg[64];
+                snprintf(errmsg, sizeof(errmsg),
+                         "Invalid frequency — enter %.2f to %.2f",
+                         min_mhz, max_mhz);
+                set_msg(errmsg);
             }
             mode = M_NORMAL;
             tune_len = 0; tune_buf[0] = '\0';
