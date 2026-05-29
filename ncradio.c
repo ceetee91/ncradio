@@ -797,6 +797,7 @@ static void handle_key(int ch)
             break;
 
         case 's':
+            if (radio.muted) { set_msg("Unmute first!"); break; }
             prescan_count = config.count;
             memcpy(prescan_freqs, config.freqs, sizeof(config.freqs));
             memcpy(prescan_names, config.names, sizeof(config.names));
@@ -812,11 +813,13 @@ static void handle_key(int ch)
 
         /* Step frequency by the configured scan step */
         case ',':
+            if (radio.muted) { set_msg("Unmute first!"); break; }
             radio_set_freq(&radio, radio.freq_hz - config.scan_step_hz);
             signal_pct = radio_get_signal(&radio);
             break;
 
         case '.':
+            if (radio.muted) { set_msg("Unmute first!"); break; }
             radio_set_freq(&radio, radio.freq_hz + config.scan_step_hz);
             signal_pct = radio_get_signal(&radio);
             break;
@@ -833,6 +836,7 @@ static void handle_key(int ch)
             break;
 
         case '<':
+            if (radio.muted) { set_msg("Unmute first!"); break; }
             radio_start_seek(&radio, 0,
                              config.scan_step_hz,
                              (config.signal_threshold_pct * 65535) / 100);
@@ -843,6 +847,7 @@ static void handle_key(int ch)
             break;
 
         case '>':
+            if (radio.muted) { set_msg("Unmute first!"); break; }
             radio_start_seek(&radio, 1,
                              config.scan_step_hz,
                              (config.signal_threshold_pct * 65535) / 100);
@@ -853,6 +858,7 @@ static void handle_key(int ch)
             break;
 
         case 't':
+            if (radio.muted) { set_msg("Unmute first!"); break; }
             mode = M_TUNING;
             tune_len = 0; tune_buf[0] = '\0';
             break;
@@ -914,6 +920,7 @@ static void handle_key(int ch)
             break;
 
         case '\n': case KEY_ENTER:
+            if (radio.muted) { set_msg("Unmute first!"); break; }
             if (preset_sel >= 0 && preset_sel < config.count) {
                 radio_set_freq(&radio, config.freqs[preset_sel]);
                 signal_pct = radio_get_signal(&radio);
