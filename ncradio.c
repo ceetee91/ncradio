@@ -33,7 +33,7 @@
 #define CP_SCAN    7
 #define CP_CUR     8
 
-typedef enum { M_NORMAL, M_TUNING, M_SCANNING, M_EDITING, M_SETTINGS } Mode;
+typedef enum { M_NORMAL, M_TUNING, M_SCANNING, M_EDITING, M_SETTINGS, M_SEEKING } Mode;
 
 static Radio  radio;
 static Config config;
@@ -191,6 +191,11 @@ static void draw_info(void)
             draw_bar(ROW_INFO, x0, bw, pct, CP_SCAN);
             mvprintw(ROW_INFO, x0 + bw, "]%3d%%", pct);
         }
+    } else if (mode == M_SEEKING) {
+        attron(COLOR_PAIR(CP_SCAN) | A_BOLD);
+        mvprintw(ROW_INFO, 2, "Seeking %s ...",
+                 radio.seek_fwd ? "forward >" : "backward <");
+        attroff(COLOR_PAIR(CP_SCAN) | A_BOLD);
     } else {
         /* M_NORMAL / M_SETTINGS / M_EDITING — timed msg then RDS RT */
         if (status_msg[0] && time(NULL) < status_msg_exp) {
@@ -422,6 +427,9 @@ static void draw_help(void)
     move(y, 0); hline(ACS_HLINE, COLS);
     attron(A_DIM);
     switch (mode) {
+    case M_SEEKING:
+        mvprintw(y + 1, 2, "Any key: cancel seek");
+        break;
     case M_SCANNING:
         mvprintw(y + 1, 2, "s/Esc:stop scan & save   q:stop & quit");
         break;
@@ -440,9 +448,9 @@ static void draw_help(void)
         break;
     case M_NORMAL:
         mvprintw(y + 1, 2,
-                 "s:scan  ,:step<  .:step>  t:tune  m:mute  +/-:vol  a:add  d:del  e:rename  o:settings");
+                 "s:scan  ,:step<  .:step>  <:seek<  >:seek>  t:tune  m:mute  +/-:vol");
         mvprintw(y + 2, 2,
-                 "Up/Dn:row  Left/Right:col  Enter:tune to preset   q:quit");
+                 "a:add  d:del  e:rename  o:settings  Up/Dn  Left/Right:navigate  Enter:tune  q:quit");
         break;
     }
     attroff(A_DIM);
@@ -591,6 +599,14 @@ static void handle_key(int ch)
         }
         break;
 
+    case M_SEEKING:
+        /* Any key cancels the seek and restores the pre-seek frequency */
+        radio_stop_seek(&radio);
+        radio_set_freq(&radio, radio.freq_hz);
+        mode = M_NORMAL;
+        if (ch == 'q') running = 0;
+        break;
+
     case M_SCANNING:
         if (ch == 's' || ch == 27) finish_scan(0);
         else if (ch == 'q')        finish_scan(1);
@@ -630,6 +646,20 @@ static void handle_key(int ch)
         case KEY_RIGHT:
             preset_sel += preset_rows_per_col;
             if (preset_sel >= config.count) preset_sel = config.count - 1;
+            break;
+
+        case '<':
+            radio_start_seek(&radio, 0,
+                             config.scan_step_hz,
+                             (config.signal_threshold_pct * 65535) / 100);
+            mode = M_SEEKING;
+            break;
+
+        case '>':
+            radio_start_seek(&radio, 1,
+                             config.scan_step_hz,
+                             (config.signal_threshold_pct * 65535) / 100);
+            mode = M_SEEKING;
             break;
 
         case 't':
@@ -764,7 +794,7 @@ int main(int argc, char *argv[])
     struct timeval last_sig = {0, 0};
 
     while (running) {
-        if (mode != M_SCANNING) {
+        if (mode != M_SCANNING && mode != M_SEEKING) {
             struct timeval now;
             gettimeofday(&now, NULL);
             long ms = (now.tv_sec  - last_sig.tv_sec)  * 1000
@@ -778,6 +808,19 @@ int main(int argc, char *argv[])
 
         if (mode == M_SCANNING && !radio.scanning && radio.scan_started)
             finish_scan(0);
+
+        if (mode == M_SEEKING && !radio.seeking && radio.seek_started) {
+            radio_stop_seek(&radio);
+            if (radio.seek_result_hz) {
+                radio_set_freq(&radio, radio.seek_result_hz);
+                signal_pct = radio_get_signal(&radio);
+                set_msg("Station found.");
+            } else {
+                radio_set_freq(&radio, radio.freq_hz);  /* restore pre-seek freq */
+                set_msg("No station found.");
+            }
+            mode = M_NORMAL;
+        }
 
         draw_all();
 

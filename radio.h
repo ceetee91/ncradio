@@ -24,6 +24,15 @@ typedef struct {
     int      scan_threshold; /* signal threshold 0-65535; 0 → SCAN_SIGNAL_THRESH */
     int      scan_rds_names; /* 1 = collect RDS names during scan */
 
+    /* seek state (software seek: step + threshold, not hardware VIDIOC_S_HW_FREQ_SEEK) */
+    volatile int  seeking;
+    int           seek_started;
+    pthread_t     seek_thread;
+    uint32_t      seek_result_hz;  /* found frequency, or 0 if none */
+    uint32_t      seek_step_hz;
+    int           seek_threshold;
+    int           seek_fwd;
+
     /* scan state — mutex protects found_*, scan_pos_hz */
     volatile int    scanning;
     int             scan_started;
@@ -46,3 +55,6 @@ int      radio_seek(Radio *r, int fwd); /* 1=fwd 0=back; -1 on hw error */
 void     radio_read_rds(Radio *r);      /* non-blocking drain of pending RDS blocks */
 void     radio_start_scan(Radio *r);
 void     radio_stop_scan(Radio *r);     /* safe even if scan already done */
+/* Software seek: step by step_hz, stop at first freq >= threshold (0-65535) */
+void     radio_start_seek(Radio *r, int fwd, uint32_t step_hz, int threshold);
+void     radio_stop_seek(Radio *r);     /* safe even if seek already done */

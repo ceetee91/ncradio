@@ -162,6 +162,68 @@ void radio_read_rds(Radio *r)
     drain_rds(r->fd, &r->rds);
 }
 
+static void *seek_fn(void *arg)
+{
+    Radio *r = arg;
+    int      fwd       = r->seek_fwd;
+    uint32_t step      = r->seek_step_hz  > 0 ? r->seek_step_hz  : FREQ_STEP_HZ;
+    int      threshold = r->seek_threshold > 0 ? r->seek_threshold : SCAN_SIGNAL_THRESH;
+
+    r->seek_result_hz = 0;
+
+    /* Maximum steps for a full sweep of the FM band */
+    int max_steps = (int)((FREQ_MAX_HZ - FREQ_MIN_HZ) / step) + 2;
+    uint32_t f = r->freq_hz;
+
+    for (int s = 0; s < max_steps && r->seeking; s++) {
+        /* Advance first so we don't re-check the current frequency */
+        if (fwd)
+            f = (f + step > FREQ_MAX_HZ) ? FREQ_MIN_HZ : f + step;
+        else
+            f = (f < FREQ_MIN_HZ + step) ? FREQ_MAX_HZ : f - step;
+
+        struct v4l2_frequency vf = {
+            .tuner = 0, .type = V4L2_TUNER_RADIO,
+            .frequency = hz_to_v4l2(r, f)
+        };
+        ioctl(r->fd, VIDIOC_S_FREQUENCY, &vf);
+        msleep(80);
+
+        if (!r->seeking) break;
+
+        struct v4l2_tuner t = { .index = 0 };
+        ioctl(r->fd, VIDIOC_G_TUNER, &t);
+
+        if ((int)t.signal >= threshold) {
+            r->seek_result_hz = f;
+            break;
+        }
+    }
+
+    r->seeking = 0;
+    return NULL;
+}
+
+void radio_start_seek(Radio *r, int fwd, uint32_t step_hz, int threshold)
+{
+    if (r->seek_started) return;
+    r->seek_fwd       = fwd;
+    r->seek_step_hz   = step_hz;
+    r->seek_threshold = threshold;
+    r->seek_result_hz = 0;
+    r->seeking        = 1;
+    r->seek_started   = 1;
+    pthread_create(&r->seek_thread, NULL, seek_fn, r);
+}
+
+void radio_stop_seek(Radio *r)
+{
+    if (!r->seek_started) return;
+    r->seeking = 0;
+    pthread_join(r->seek_thread, NULL);
+    r->seek_started = 0;
+}
+
 static void *scan_fn(void *arg)
 {
     Radio *r = arg;
