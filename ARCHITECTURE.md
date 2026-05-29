@@ -5,10 +5,12 @@
 ```
 ncradio/
 ├── ncradio.c   — ncurses UI and application main loop
-├── radio.c     — V4L2 hardware interface and scan thread
+├── radio.c     — V4L2 hardware interface and scan/seek threads
 ├── radio.h     — Radio struct and public function declarations
 ├── rds.c       — RDS block decoder (PS name, Radio Text)
 ├── rds.h       — RdsDecoder struct and rds_feed() declaration
+├── audio.c     — ALSA audio pipe (capture → playback thread)
+├── audio.h     — Audio struct and public function declarations
 ├── config.c    — ~/.ncradio.conf read/write
 ├── config.h    — Config struct and function declarations
 └── Makefile
@@ -48,6 +50,68 @@ rt_ab           — current RT A/B flag; toggle signals a new RT message
 
 `rds_init()` resets all fields; called whenever the tuner changes frequency.
 
+### `audio.c` / `audio.h`
+
+An ALSA-based audio pipe that runs in a background thread. It is entirely
+independent of the V4L2 radio module; the two interact only through
+`config.audio_device` and `config.audio_enabled`.
+
+**`Audio` struct:**
+
+```
+device[]    — ALSA capture device name (e.g. "hw:2,0")
+running     — volatile; cleared by thread on exit or by caller to stop
+started     — 1 if pthread_create was called (thread needs joining)
+thread      — pthread handle
+rate        — detected sample rate, set by thread after hardware probe
+channels    — detected channel count (1 or 2), set by thread
+errmsg[]    — last error string; empty while running normally
+```
+
+**`audio_fn` thread — startup sequence:**
+
+```
+1. snd_pcm_open(capture, device, CAPTURE)
+2. snd_pcm_hw_params_any → probe rates with snd_pcm_hw_params_test_rate
+     candidate list: {96000, 48000, 44100, 32000, 22050, 16000}
+     first match (highest) is selected
+3. Configure capture: S16_LE, stereo (fallback mono), detected rate,
+     period ≈ 4096 frames
+4. snd_pcm_open(playback, "default", PLAYBACK)
+5. Configure playback: same format/channels/rate
+     → "default" routes to PulseAudio/PipeWire/ALSA hw as configured
+6. a->rate and a->channels written (read by UI for display)
+```
+
+**`audio_fn` transfer loop:**
+
+```
+while a->running:
+    snd_pcm_wait(cap, 100ms)   — yields CPU; allows stop-flag check on timeout
+    snd_pcm_readi(cap, buf, period)
+    snd_pcm_writei(play, buf, n)
+    snd_pcm_recover on xrun in either direction
+```
+
+The 100 ms `snd_pcm_wait` timeout means `audio_stop()` (which sets
+`a->running = 0` then `pthread_join`) returns within ~100 ms of being called,
+regardless of the hardware period size.
+
+**`audio_enum_devices`** calls `snd_device_name_hint(-1, "pcm", ...)` and
+filters to entries where `IOID` is `"Input"` (or absent, meaning both
+directions) **and** the device name starts with `"hw:"`. This excludes virtual
+ALSA plugins (`default`, `dmix`, `null`, `plug*`, etc.) and gives only
+physical capture endpoints.
+
+**`audio_start`** calls `audio_stop` first (making it safe to call repeatedly),
+then spawns the thread. **`audio_stop`** is idempotent and safe to call when no
+thread is running.
+
+**Thread safety** — `a->rate` and `a->channels` are written once by the thread
+during startup, then only read by the UI thread for display. The benign data
+race on these `int`-sized fields is acceptable; they are informational only.
+`a->errmsg` follows the same pattern.
+
 ### `config.c` / `config.h`
 
 Handles `~/.ncradio.conf`. The `Config` struct holds:
@@ -56,18 +120,22 @@ Handles `~/.ncradio.conf`. The `Config` struct holds:
 uint32_t freqs[MAX_PRESETS]                  — station frequencies in Hz
 char     names[MAX_PRESETS][NAME_MAX_LEN+1]  — optional display name per preset
 int      count                               — number of presets
-uint32_t scan_step_hz                        — scan/step increment (Hz)
+uint32_t scan_step_hz                        — scan/step/seek increment (Hz)
 int      signal_threshold_pct                — minimum signal strength (0-100%)
 int      rds_names                           — 1 = collect RDS names during scan
+int      audio_enabled                       — 1 = start audio pipe at launch
+char     audio_device[64]                    — ALSA capture device (e.g. "hw:2,0")
 ```
 
 **File format:**
 
 ```
 # ncradio configuration
-scan_step=100000         ← key=value settings (first char not a digit)
+scan_step=100000         ← integer key=value
 signal_threshold=30
 rds_names=1
+audio_enabled=1
+audio_device=hw:2,0      ← string key=value
 # stations
 87.90 BBC Radio 1        ← float [optional name]
 98.50
@@ -76,12 +144,12 @@ rds_names=1
 Lines are categorised at load time:
 - `#` or blank → skip
 - contains `=` and first char is not a digit → settings `key=value`
+  (parsed with `%39[^=]=%79[^\n]`; `atoi` applied for integer fields)
 - parseable as a float in 87.5–108.0 → station (remainder of line is the name)
 
-Defaults (`DEFAULT_SCAN_STEP_HZ`, `DEFAULT_SIGNAL_THRESH_PCT`, `DEFAULT_RDS_NAMES`)
-are seeded before reading, so the struct is always valid even when the file is
-absent or has no settings lines. After parsing, `settings_defaults()` clamps
-values to their valid ranges.
+Defaults are seeded before reading so the struct is always valid even when the
+file is absent or has no settings lines. After parsing, `settings_defaults()`
+clamps numeric values to their valid ranges.
 
 `config_save()` always writes settings before stations. The format is
 backward-compatible: old ncradio versions skip `key=value` lines because
@@ -89,7 +157,7 @@ backward-compatible: old ncradio versions skip `key=value` lines because
 
 ### `radio.c` / `radio.h`
 
-Owns the V4L2 file descriptor and the scan background thread.
+Owns the V4L2 file descriptor and the scan/seek background threads.
 
 **`Radio` struct — key fields:**
 
@@ -98,15 +166,22 @@ fd              — open file descriptor for /dev/radioN
 cap_low         — 1 if V4L2 freq unit is 62.5 Hz, else 62.5 kHz
 rds_capable     — hardware advertises V4L2_TUNER_CAP_RDS
 stereo          — updated from rxsubchans on every radio_get_signal() call
-freq_hz         — current tuned frequency in Hz (unchanged while scan runs)
+freq_hz         — current tuned frequency in Hz (unchanged while scan/seek runs)
 rds             — RdsDecoder for the live (non-scan) stream
 
-scan_step_hz    — frequency step for the scan thread (set from config before start)
-scan_threshold  — raw V4L2 signal threshold (0-65535, set from config before start)
-scan_rds_names  — 1 = collect RDS names during scan (set from config before start)
+scan_step_hz    — frequency step for scan thread (copied from config before start)
+scan_threshold  — raw V4L2 signal threshold 0-65535 (from config before start)
+scan_rds_names  — 1 = collect RDS names (from config before start)
 
-scanning        — volatile; cleared by thread on completion or by caller to abort
-scan_started    — 1 if pthread_create was called (thread needs joining)
+seeking         — volatile stop flag for seek thread
+seek_started    — 1 if seek thread needs joining
+seek_result_hz  — found frequency set by seek thread, or 0 if not found
+seek_step_hz    — step used by seek thread
+seek_threshold  — signal threshold used by seek thread
+seek_fwd        — 1 = forward seek, 0 = backward
+
+scanning        — volatile stop flag for scan thread
+scan_started    — 1 if scan thread needs joining
 mutex           — protects found_freqs, found_names, found_count, scan_pos_hz
 ```
 
@@ -120,34 +195,26 @@ both `tuner.signal` (→ 0-100%) and `tuner.rxsubchans & V4L2_TUNER_SUB_STEREO`
 
 **RDS streaming** — `radio_read_rds()` does a zero-timeout `poll()` + `read()`
 to drain pending RDS blocks into `r->rds`. Called each 500 ms tick outside
-scan mode. The static `drain_rds()` helper is reused inside `collect_rds()`
-for scan-time RDS collection.
+scan/seek mode.
 
-**`radio_set_freq()` and `radio_seek()`** call `rds_init(&r->rds)` after a
-successful ioctl so the live RDS state clears when the frequency changes.
+**`radio_set_freq()` and `radio_seek()`** call `rds_init(&r->rds)` so the live
+RDS state clears when the frequency changes.
 
-**Scan thread (`scan_fn`):**
+**Scan thread (`scan_fn`)** — steps every `scan_step_hz` Hz across the FM
+band, dwells 120 ms at each step to let the tuner settle, reads signal, and
+adds stations above threshold to `found_freqs[]`. Optionally runs
+`collect_rds()` for up to 1.5 s per found station.
 
-```
-1. Resolve effective step/threshold/rds_names from scan_* fields
-   (fall back to FREQ_STEP_HZ / SCAN_SIGNAL_THRESH if zero)
-2. For each frequency from FREQ_MIN_HZ to FREQ_MAX_HZ in step increments:
-   a. Set frequency via VIDIOC_S_FREQUENCY
-   b. Sleep 120 ms (tuner settling time)
-   c. Read signal via VIDIOC_G_TUNER
-   d. If signal < threshold: continue
-   e. Lock mutex, append to found_freqs[] with empty name, unlock
-      (UI can show the station immediately)
-   f. If rds_capable && scan_rds_names:
-        collect_rds() for up to 1500 ms (exits early on ps_ready)
-        Lock mutex, store PS name in found_names[], unlock
-      Else: msleep(200)
-3. Set r->scanning = 0 to signal natural completion
-```
+**Seek thread (`seek_fn`)** — same step/threshold parameters as scan, but
+steps in one direction and exits on the first matching frequency. Uses 80 ms
+settle time (faster than scan since only one station needs to be found). Wraps
+around at the band edge and terminates after at most one full sweep.
+`r->seek_result_hz` carries the result back to the main thread (0 = not found).
 
-`collect_rds()` polls the fd in 50 ms increments, checking `r->scanning`
-each time to support early abort. `radio_stop_scan()` sets `r->scanning = 0`
-and calls `pthread_join`; safe to call even after the thread finished naturally.
+Both threads follow the same lifecycle: `r->scanning` / `r->seeking` is
+`volatile` and serves as both a stop flag (written by main thread) and a
+completion signal (written by thread on natural exit). `scan_started` /
+`seek_started` tracks whether `pthread_join` is needed.
 
 ### `ncradio.c`
 
@@ -161,6 +228,7 @@ M_TUNING    — user typing a frequency after 't'
 M_SCANNING  — scan thread running
 M_EDITING   — user renaming a preset after 'e'
 M_SETTINGS  — settings panel open after 'o'
+M_SEEKING   — seek thread running
 ```
 
 **Screen layout — fixed rows on `stdscr`:**
@@ -169,92 +237,68 @@ M_SETTINGS  — settings panel open after 'o'
 Row 0          title bar
 Row 1          horizontal separator
 Row 2          frequency  [ST/MO]  signal bar
-Row 3          volume bar  [MUTED]  RDS PS name (right-aligned, green)
+Row 3          volume bar  [MUTED]  [A]/[A!]  RDS PS name (right-aligned)
 Row 4          mode info line:
-                 M_NORMAL/M_SETTINGS  — timed status message, then RDS RT (dim)
+                 M_NORMAL/M_SETTINGS  — timed status message, then RDS RT
                  M_TUNING             — "Tune (MHz): ___"
                  M_EDITING            — "Name: ___"
-                 M_SCANNING           — "Scanning XX.XX MHz  Found: N  [====] XX%"
+                 M_SCANNING           — scan progress bar
+                 M_SEEKING            — "Seeking forward >" / "Seeking backward <"
 Row 5          horizontal separator
 Rows 6…LINES-4 list area:
-                 M_NORMAL/M_TUNING/M_EDITING  — preset grid (multi-column)
-                 M_SCANNING                   — found-stations list (auto-scroll)
-                 M_SETTINGS                   — settings panel
+                 M_NORMAL/M_TUNING/M_EDITING/M_SEEKING — preset grid
+                 M_SCANNING                            — found-stations list
+                 M_SETTINGS                            — settings panel
 LINES-3        horizontal separator
 LINES-2        help line (context-sensitive)
 LINES-1        second help line (M_NORMAL only)
 ```
 
+**Audio indicator** (row 3):
+- `[A]` green — audio pipe is running
+- `[A!]` red — pipe stopped with an error (error text visible in settings panel)
+- absent — audio disabled in config
+
+**Settings panel** (`draw_settings()`) — five rows in the list area:
+
+```
+Row +2   Scan step:          0.10 MHz    <- -> to cycle
+Row +3   Signal threshold:   30%         <- -> to adjust (5% steps)
+Row +4   Save RDS names:     Yes         <- -> or Enter to toggle
+Row +5   Audio output:       On (48000Hz 2ch)  <- -> or Enter to toggle
+Row +6   Audio device:       hw:2,0      <- -> to cycle  <description>
+```
+
+Changing **Audio output** calls `audio_apply()` which starts or stops the
+`Audio` thread immediately. Changing **Audio device** while audio is on calls
+`audio_start()` directly (which calls `audio_stop()` first), so the pipe
+restarts on the new device without any manual toggle.
+
+`audio_apply()` also handles the first-run case: if audio is enabled but no
+device is configured, it auto-selects `audio_dev_names[0]` and saves it.
+
 **Preset grid layout** (`preset_layout()` in `draw_presets()`):
 
-Each cell is `ENTRY_BASE` (13) chars for the fixed fields:
+Each cell is `ENTRY_BASE` (13) chars:
 ```
 marker(1) + index(2) + dot(1) + space(1) + freq-6chars(6) + space(1) + cur-mark(1)
 ```
-If the preset list contains any named entries, a name column of up to 12
-display chars is appended (one space separator + name). Column count and per-column
-width are computed from the terminal width and the longest name:
+Column count and name-display width are computed from terminal width and the
+longest name in the list. Column-major ordering: item `i` is at visual row
+`i % rows_per_col`, column `i / rows_per_col`. `preset_rows_per_col` is
+written by `draw_presets()` and used by `handle_key()` for `←`/`→` column
+jumps.
 
-```
-entry_w  = ENTRY_BASE + (max_name > 0 ? 1 + max_name : 0)
-col_w_mn = entry_w + 1           (minimum column width, 1-char gap)
-ncols    = clamp(avail / col_w_mn, 1, 6)
-col_w    = avail / ncols          (distribute space evenly)
-name_w   = clamp(col_w - ENTRY_BASE - 1, 0, max_name)
-```
+**Signal and RDS polling** — every 500 ms outside scan/seek mode,
+`radio_get_signal()` and `radio_read_rds()` update `signal_pct`, `radio.stereo`,
+and `radio.rds`.
 
-Example at 80 columns:
-- 0 names → 5 columns, 15 chars each, no name field
-- max name 8 chars → 3 columns, 26 chars each, 8-char name visible
-
-**Column-major ordering** — items fill downward within each column before
-spilling into the next, like `ls` output. Item `i` occupies visual row
-`i % rows_per_col` and column `i / rows_per_col`, where
-`rows_per_col = ceil(count / ncols)`. The last column may have fewer items
-than the others; those cells are simply left blank.
-
-**Row-based scrolling** — `list_offset` is a *row* offset (not an entry
-offset). The selected entry's row is `preset_sel % rows_per_col`. The scroll
-invariant is:
-```
-item_row ∈ [list_offset, list_offset + vis_rows)
-```
-adjusted on every draw call. PgUp/PgDn move by `vis_rows` items (one
-visible window of rows), which scrolls down within the same column group.
-
-**Scan-list auto-scroll** — during M_SCANNING the visible window starts at
-`max(0, found_count - vis_rows)`, which always shows the most recently found
-station without any user interaction.
-
-**Manual step** — `,`/`←` and `.`/`→` call `radio_set_freq()` with
-`freq_hz ± config.scan_step_hz`. `radio_set_freq()` clamps to
-`[FREQ_MIN_HZ, FREQ_MAX_HZ]`. The same step size is used for both manual
-stepping and the automatic scan.
-
-**Tuning-mode comma** — in M_TUNING, `,` is treated as `.` (decimal point).
-Duplicate decimal points are rejected.
-
-**Scan parameters hand-off** — when `s` is pressed, three fields are copied
-into `Radio` before `radio_start_scan()`:
-```c
-radio.scan_step_hz   = config.scan_step_hz;
-radio.scan_threshold = (config.signal_threshold_pct * 65535) / 100;
-radio.scan_rds_names = config.rds_names;
-```
-The scan thread reads only from `Radio`, keeping it decoupled from `Config`.
-
-**Settings panel** (`draw_settings()`) — three rows in the list area when
-M_SETTINGS is active. `←`/`→` cycle or increment each setting; every
-keystroke calls `config_save()` immediately. `Esc` or `o` closes the panel.
-
-**Signal and RDS polling** — every 500 ms (outside scan mode), the main loop
-calls `radio_get_signal()` (updates `signal_pct` and `radio.stereo`) and
-`radio_read_rds()` (drains pending RDS blocks into `radio.rds`).
-
-**Thread safety** — the scan thread never calls ncurses. `radio.scanning` is
-`volatile` and read without a lock (single-word). All multi-field scan state
-(`found_freqs`, `found_names`, `found_count`, `scan_pos_hz`) is accessed under
-`radio.mutex`.
+**Thread safety** — neither the scan, seek, nor audio threads call ncurses.
+`radio.scanning`, `radio.seeking`, and `audio.running` are `volatile` and read
+without locks (single-word). Multi-field scan state is protected by
+`radio.mutex`. Audio thread writes `audio.rate`, `audio.channels`, and
+`audio.errmsg` once during startup; the UI reads them for display only (benign
+race).
 
 ## Data flow
 
@@ -264,30 +308,40 @@ calls `radio_get_signal()` (updates `signal_pct` and `radio.stereo`) and
     ▼
  handle_key()
     │
-    ├─ radio_set_freq(freq ± scan_step_hz)  ← , / . / ← / → keys
+    ├─ radio_set_freq(freq ± scan_step_hz)     ← , / . keys
     │       └─ ioctl(VIDIOC_S_FREQUENCY) + rds_init()
     │
-    ├─ radio_set_freq / radio_mute / radio_set_volume
-    │       └─ ioctl(fd, VIDIOC_…)  ──►  /dev/radioN
+    ├─ radio_start_seek(fwd, step, threshold)  ← < / > keys
+    │       └─ pthread_create → seek_fn
+    │                   └─ VIDIOC_S_FREQUENCY + VIDIOC_G_TUNER per step
+    │                      → seek_result_hz
     │
-    ├─ config_add / config_del / config_save  ──►  ~/.ncradio.conf
+    ├─ radio_start_scan                        ← s key
+    │       └─ pthread_create → scan_fn
+    │                   ├─ VIDIOC_S_FREQUENCY + VIDIOC_G_TUNER per step
+    │                   └─ collect_rds → read(fd) → rds_feed → found_names[]
     │
-    ├─ handle_settings_key → config fields + config_save
+    ├─ audio_apply / audio_start / audio_stop  ← settings o key
+    │       └─ pthread_create → audio_fn
+    │                   ├─ snd_pcm_open(hw:X,Y, CAPTURE)
+    │                   ├─ probe rate, configure S16_LE
+    │                   ├─ snd_pcm_open("default", PLAYBACK)
+    │                   └─ snd_pcm_wait → snd_pcm_readi → snd_pcm_writei loop
     │
-    └─ radio_start_scan (after copying scan params into Radio)
-            └─ pthread_create → scan_fn
-                    ├─ VIDIOC_S_FREQUENCY + VIDIOC_G_TUNER (per step)
-                    └─ collect_rds → read(fd) → rds_feed → found_names[]
+    ├─ config_add / config_del / config_save   → ~/.ncradio.conf
+    │
+    └─ radio_set_freq / radio_mute / radio_set_volume
+            └─ ioctl(fd, VIDIOC_…) → /dev/radioN
 
  main loop tick (250 ms)
-    ├─ radio_get_signal  → VIDIOC_G_TUNER  →  signal_pct, radio.stereo
-    ├─ radio_read_rds    → poll + read(fd) →  rds_feed → radio.rds
-    ├─ finish_scan (on natural completion detection)
-    └─ draw_all → ncurses / terminal
+    ├─ radio_get_signal  → VIDIOC_G_TUNER  → signal_pct, radio.stereo
+    ├─ radio_read_rds    → poll+read(fd)   → rds_feed → radio.rds
+    ├─ seek completion   → radio_stop_seek + radio_set_freq(result)
+    ├─ scan completion   → finish_scan
+    └─ draw_all          → ncurses / terminal
 ```
 
 ## Build
 
 A single `Makefile` with explicit per-object dependencies. Compiled with
-`-Wall -Wextra -O2`. Linked against `-lncurses -lpthread`. No external
-libraries beyond the standard C library, ncurses, and pthreads.
+`-Wall -Wextra -O2`. Linked against `-lncurses -lpthread -lasound`.
