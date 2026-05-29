@@ -1,9 +1,11 @@
+-include config.mk
+
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -D_POSIX_C_SOURCE=199309L
-LDFLAGS = -lncurses -lpthread -lasound
+CFLAGS  = -Wall -Wextra -O2 -D_POSIX_C_SOURCE=199309L $(AUDIO_CFLAGS)
+LDFLAGS = -lncurses -lpthread $(AUDIO_LIBS)
 
 TARGET  = ncradio
-SRCS    = ncradio.c radio.c config.c rds.c audio.c
+SRCS    = ncradio.c radio.c config.c rds.c $(AUDIO_SRCS)
 OBJS    = $(SRCS:.c=.o)
 
 all: $(TARGET)
@@ -26,4 +28,7 @@ install: $(TARGET)
 clean:
 	rm -f $(OBJS) $(TARGET)
 
-.PHONY: all install clean
+distclean: clean
+	rm -f config.mk
+
+.PHONY: all install clean distclean

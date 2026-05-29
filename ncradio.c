@@ -11,7 +11,9 @@
 
 #include "radio.h"
 #include "config.h"
+#ifdef HAVE_AUDIO
 #include "audio.h"
+#endif
 
 #define VERSION "0.1"
 
@@ -60,10 +62,15 @@ static int settings_sel = 0;
 #define SETTING_SCAN_STEP    0
 #define SETTING_THRESHOLD    1
 #define SETTING_RDS_NAMES    2
+#ifdef HAVE_AUDIO
 #define SETTING_AUDIO_ENABLE 3
 #define SETTING_AUDIO_DEV    4
 #define SETTING_COUNT        5
+#else
+#define SETTING_COUNT        3
+#endif
 
+#ifdef HAVE_AUDIO
 /* audio state and enumerated capture devices */
 static Audio audio;
 static char  audio_dev_names[AUDIO_DEV_MAX][AUDIO_DEV_NAMELEN];
@@ -90,6 +97,7 @@ static void audio_apply(void)
     if (config.audio_device[0])
         audio_start(&audio, config.audio_device);
 }
+#endif /* HAVE_AUDIO */
 
 /* cycle list for scan step (Hz) */
 static const uint32_t scan_steps[] = { 25000, 50000, 100000, 200000 };
@@ -178,6 +186,7 @@ static void draw_volume(void)
         attroff(COLOR_PAIR(CP_SIG_LO) | A_BOLD | A_REVERSE);
     }
 
+#ifdef HAVE_AUDIO
     /* Audio pipe indicator */
     if (config.audio_enabled) {
         if (audio.running) {
@@ -190,6 +199,7 @@ static void draw_volume(void)
             attroff(COLOR_PAIR(CP_SIG_LO) | A_BOLD);
         }
     }
+#endif
 
     /* RDS station name — right-aligned */
     if (radio.rds_capable && radio.rds.ps_ready && radio.rds.ps[0]) {
@@ -271,15 +281,19 @@ static void draw_settings(void)
         "Scan step:",
         "Signal threshold:",
         "Save RDS names:",
+#ifdef HAVE_AUDIO
         "Audio output:",
         "Audio device:",
+#endif
     };
     static const char *base_hints[SETTING_COUNT] = {
         "<- -> to cycle",
         "<- -> to adjust (5% steps)",
         "<- -> or Enter to toggle",
+#ifdef HAVE_AUDIO
         "<- -> or Enter to toggle",
         "<- -> to cycle",
+#endif
     };
 
     for (int i = 0; i < SETTING_COUNT; i++) {
@@ -298,6 +312,7 @@ static void draw_settings(void)
             snprintf(valstr, sizeof(valstr), "%s",
                      config.rds_names ? "Yes" : "No");
             break;
+#ifdef HAVE_AUDIO
         case SETTING_AUDIO_ENABLE:
             if (config.audio_enabled && audio.running)
                 snprintf(valstr, sizeof(valstr), "On (%uHz %dch)",
@@ -316,6 +331,7 @@ static void draw_settings(void)
             else
                 snprintf(valstr, sizeof(valstr), "(none detected)");
             break;
+#endif
         }
 
         int row = top + 2 + i;
@@ -324,8 +340,8 @@ static void draw_settings(void)
                  i == settings_sel ? '>' : ' ', labels[i], valstr);
         if (i == settings_sel) attroff(COLOR_PAIR(CP_SEL) | A_BOLD);
 
-        /* Hint — for audio device, append the description of the current entry */
         attron(A_DIM);
+#ifdef HAVE_AUDIO
         if (i == SETTING_AUDIO_DEV) {
             int idx = audio_dev_idx();
             if (audio_dev_count == 0)
@@ -339,6 +355,9 @@ static void draw_settings(void)
         } else {
             mvprintw(row, 44, "%s", base_hints[i]);
         }
+#else
+        mvprintw(row, 44, "%s", base_hints[i]);
+#endif
         attroff(A_DIM);
     }
 }
@@ -607,6 +626,7 @@ static void handle_settings_key(int ch)
         } else if (settings_sel == SETTING_RDS_NAMES) {
             config.rds_names = !config.rds_names;
             config_save(&config);
+#ifdef HAVE_AUDIO
         } else if (settings_sel == SETTING_AUDIO_ENABLE) {
             config.audio_enabled = !config.audio_enabled;
             audio_apply();
@@ -622,6 +642,7 @@ static void handle_settings_key(int ch)
                     audio_start(&audio, config.audio_device);
                 config_save(&config);
             }
+#endif
         }
         break;
     }
@@ -630,10 +651,12 @@ static void handle_settings_key(int ch)
         if (settings_sel == SETTING_RDS_NAMES) {
             config.rds_names = !config.rds_names;
             config_save(&config);
+#ifdef HAVE_AUDIO
         } else if (settings_sel == SETTING_AUDIO_ENABLE) {
             config.audio_enabled = !config.audio_enabled;
             audio_apply();
             config_save(&config);
+#endif
         }
         break;
 
@@ -864,12 +887,14 @@ int main(int argc, char *argv[])
 
     config_load(&config);
 
+#ifdef HAVE_AUDIO
     /* Enumerate ALSA capture devices for the settings panel */
     audio_enum_devices(audio_dev_names, audio_dev_descs,
                        &audio_dev_count, AUDIO_DEV_MAX);
 
     /* Start audio pipe if enabled */
     audio_apply();
+#endif
 
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
@@ -936,7 +961,9 @@ int main(int argc, char *argv[])
     if (mode == M_SCANNING) finish_scan(0);
 
     endwin();
+#ifdef HAVE_AUDIO
     audio_stop(&audio);
+#endif
     radio_close(&radio);
     return 0;
 }
