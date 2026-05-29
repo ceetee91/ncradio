@@ -14,23 +14,23 @@ static const char *path(void)
     return buf;
 }
 
-/* Apply defaults and clamp settings to valid ranges. */
 static void settings_defaults(Config *c)
 {
     if (c->scan_step_hz < 25000 || c->scan_step_hz > 1000000)
         c->scan_step_hz = DEFAULT_SCAN_STEP_HZ;
     if (c->signal_threshold_pct < 5 || c->signal_threshold_pct > 95)
         c->signal_threshold_pct = DEFAULT_SIGNAL_THRESH_PCT;
-    c->rds_names = c->rds_names ? 1 : 0;
+    c->rds_names    = c->rds_names    ? 1 : 0;
+    c->audio_enabled = c->audio_enabled ? 1 : 0;
 }
 
 int config_load(Config *c)
 {
     memset(c, 0, sizeof(*c));
-    /* Seed defaults so unset values are usable even if file is absent */
     c->scan_step_hz         = DEFAULT_SCAN_STEP_HZ;
     c->signal_threshold_pct = DEFAULT_SIGNAL_THRESH_PCT;
     c->rds_names            = DEFAULT_RDS_NAMES;
+    c->audio_enabled        = DEFAULT_AUDIO_ENABLED;
 
     FILE *f = fopen(path(), "r");
     if (!f) return 0;
@@ -39,15 +39,20 @@ int config_load(Config *c)
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
 
-        /* Settings line: key=value (first char is not a digit) */
-        char *eq = strchr(line, '=');
-        if (eq && !isdigit((unsigned char)line[0])) {
-            char key[40] = {0};
-            int  val = 0;
-            if (sscanf(line, "%39[^=]=%d", key, &val) == 2) {
-                if      (strcmp(key, "scan_step")         == 0) c->scan_step_hz = (uint32_t)val;
-                else if (strcmp(key, "signal_threshold")  == 0) c->signal_threshold_pct = val;
-                else if (strcmp(key, "rds_names")         == 0) c->rds_names = val ? 1 : 0;
+        /* Settings line: key=value (first char not a digit) */
+        if (strchr(line, '=') && !isdigit((unsigned char)line[0])) {
+            char key[40]  = {0};
+            char sval[80] = {0};
+            if (sscanf(line, "%39[^=]=%79[^\n]", key, sval) < 1) continue;
+            int ival = atoi(sval);
+
+            if      (strcmp(key, "scan_step")        == 0) c->scan_step_hz = (uint32_t)ival;
+            else if (strcmp(key, "signal_threshold")  == 0) c->signal_threshold_pct = ival;
+            else if (strcmp(key, "rds_names")         == 0) c->rds_names = ival ? 1 : 0;
+            else if (strcmp(key, "audio_enabled")     == 0) c->audio_enabled = ival ? 1 : 0;
+            else if (strcmp(key, "audio_device")      == 0) {
+                strncpy(c->audio_device, sval, sizeof(c->audio_device) - 1);
+                c->audio_device[sizeof(c->audio_device) - 1] = '\0';
             }
             continue;
         }
@@ -85,6 +90,9 @@ int config_save(const Config *c)
     fprintf(f, "scan_step=%u\n",        c->scan_step_hz);
     fprintf(f, "signal_threshold=%d\n", c->signal_threshold_pct);
     fprintf(f, "rds_names=%d\n",        c->rds_names);
+    fprintf(f, "audio_enabled=%d\n",    c->audio_enabled);
+    if (c->audio_device[0])
+        fprintf(f, "audio_device=%s\n", c->audio_device);
     fprintf(f, "# stations\n");
     for (int i = 0; i < c->count; i++) {
         if (c->names[i][0])

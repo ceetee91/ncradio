@@ -5,10 +5,11 @@
 #define NAME_MAX_LEN  32
 #define CONFIG_FILE   "/.ncradio.conf"
 
-/* Default scan settings (used when config has no stored value) */
-#define DEFAULT_SCAN_STEP_HZ        100000  /* 0.10 MHz */
-#define DEFAULT_SIGNAL_THRESH_PCT       30  /* 30% of full scale */
-#define DEFAULT_RDS_NAMES                1  /* save RDS names during scan */
+/* Default scan settings */
+#define DEFAULT_SCAN_STEP_HZ        100000
+#define DEFAULT_SIGNAL_THRESH_PCT       30
+#define DEFAULT_RDS_NAMES                1
+#define DEFAULT_AUDIO_ENABLED            0
 
 typedef struct {
     /* stations */
@@ -17,14 +18,17 @@ typedef struct {
     int      count;
 
     /* scan settings */
-    uint32_t scan_step_hz;        /* frequency step during scan, Hz */
-    int      signal_threshold_pct;/* minimum signal to record a station, 0-100 */
-    int      rds_names;           /* 1 = collect RDS name during scan */
+    uint32_t scan_step_hz;
+    int      signal_threshold_pct;
+    int      rds_names;
+
+    /* audio settings */
+    int      audio_enabled;
+    char     audio_device[64]; /* ALSA capture device, e.g. "hw:2,0" */
 } Config;
 
 int  config_load(Config *c);
 int  config_save(const Config *c);
-/* name may be "" — inserted in sorted order, no-op if freq already present */
 void config_add(Config *c, uint32_t hz, const char *name);
 void config_del(Config *c, int idx);
 int  config_find(const Config *c, uint32_t hz);

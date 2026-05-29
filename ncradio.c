@@ -11,6 +11,7 @@
 
 #include "radio.h"
 #include "config.h"
+#include "audio.h"
 
 #define VERSION "0.1"
 
@@ -56,10 +57,39 @@ static int  edit_len = 0;
 
 /* settings panel */
 static int settings_sel = 0;
-#define SETTING_SCAN_STEP  0
-#define SETTING_THRESHOLD  1
-#define SETTING_RDS_NAMES  2
-#define SETTING_COUNT      3
+#define SETTING_SCAN_STEP    0
+#define SETTING_THRESHOLD    1
+#define SETTING_RDS_NAMES    2
+#define SETTING_AUDIO_ENABLE 3
+#define SETTING_AUDIO_DEV    4
+#define SETTING_COUNT        5
+
+/* audio state and enumerated capture devices */
+static Audio audio;
+static char  audio_dev_names[AUDIO_DEV_MAX][AUDIO_DEV_NAMELEN];
+static char  audio_dev_descs[AUDIO_DEV_MAX][AUDIO_DEV_DESCLEN];
+static int   audio_dev_count = 0;
+
+static int audio_dev_idx(void)
+{
+    for (int i = 0; i < audio_dev_count; i++)
+        if (strcmp(audio_dev_names[i], config.audio_device) == 0) return i;
+    return -1;
+}
+
+/* Start audio if enabled and a device is configured; auto-pick first device
+   if enabled with no device set. */
+static void audio_apply(void)
+{
+    if (!config.audio_enabled) { audio_stop(&audio); return; }
+    if (!config.audio_device[0] && audio_dev_count > 0) {
+        strncpy(config.audio_device, audio_dev_names[0], 63);
+        config.audio_device[63] = '\0';
+        config_save(&config);
+    }
+    if (config.audio_device[0])
+        audio_start(&audio, config.audio_device);
+}
 
 /* cycle list for scan step (Hz) */
 static const uint32_t scan_steps[] = { 25000, 50000, 100000, 200000 };
@@ -148,6 +178,19 @@ static void draw_volume(void)
         attroff(COLOR_PAIR(CP_SIG_LO) | A_BOLD | A_REVERSE);
     }
 
+    /* Audio pipe indicator */
+    if (config.audio_enabled) {
+        if (audio.running) {
+            attron(COLOR_PAIR(CP_SIG_HI) | A_BOLD);
+            mvprintw(ROW_VOL, 41, "[A]");
+            attroff(COLOR_PAIR(CP_SIG_HI) | A_BOLD);
+        } else if (audio.errmsg[0]) {
+            attron(COLOR_PAIR(CP_SIG_LO) | A_BOLD);
+            mvprintw(ROW_VOL, 41, "[A!]");
+            attroff(COLOR_PAIR(CP_SIG_LO) | A_BOLD);
+        }
+    }
+
     /* RDS station name — right-aligned */
     if (radio.rds_capable && radio.rds.ps_ready && radio.rds.ps[0]) {
         int len = (int)strlen(radio.rds.ps);
@@ -228,15 +271,20 @@ static void draw_settings(void)
         "Scan step:",
         "Signal threshold:",
         "Save RDS names:",
+        "Audio output:",
+        "Audio device:",
     };
-    static const char *hints[SETTING_COUNT] = {
+    static const char *base_hints[SETTING_COUNT] = {
         "<- -> to cycle",
         "<- -> to adjust (5% steps)",
         "<- -> or Enter to toggle",
+        "<- -> or Enter to toggle",
+        "<- -> to cycle",
     };
 
     for (int i = 0; i < SETTING_COUNT; i++) {
-        char valstr[32];
+        char valstr[80] = {0};
+
         switch (i) {
         case SETTING_SCAN_STEP:
             snprintf(valstr, sizeof(valstr), "%.3g MHz",
@@ -246,22 +294,51 @@ static void draw_settings(void)
             snprintf(valstr, sizeof(valstr), "%d%%",
                      config.signal_threshold_pct);
             break;
-        default: /* SETTING_RDS_NAMES */
+        case SETTING_RDS_NAMES:
             snprintf(valstr, sizeof(valstr), "%s",
                      config.rds_names ? "Yes" : "No");
+            break;
+        case SETTING_AUDIO_ENABLE:
+            if (config.audio_enabled && audio.running)
+                snprintf(valstr, sizeof(valstr), "On (%uHz %dch)",
+                         audio.rate, audio.channels);
+            else if (config.audio_enabled && audio.errmsg[0])
+                snprintf(valstr, sizeof(valstr), "On (error)");
+            else
+                snprintf(valstr, sizeof(valstr), "%s",
+                         config.audio_enabled ? "On" : "Off");
+            break;
+        case SETTING_AUDIO_DEV:
+            if (config.audio_device[0])
+                snprintf(valstr, sizeof(valstr), "%s", config.audio_device);
+            else if (audio_dev_count > 0)
+                snprintf(valstr, sizeof(valstr), "(auto)");
+            else
+                snprintf(valstr, sizeof(valstr), "(none detected)");
             break;
         }
 
         int row = top + 2 + i;
         if (i == settings_sel) attron(COLOR_PAIR(CP_SEL) | A_BOLD);
-
-        mvprintw(row, 2, "%c %-20s  %-12s",
+        mvprintw(row, 2, "%c %-20s  %-18s",
                  i == settings_sel ? '>' : ' ', labels[i], valstr);
-
         if (i == settings_sel) attroff(COLOR_PAIR(CP_SEL) | A_BOLD);
 
+        /* Hint — for audio device, append the description of the current entry */
         attron(A_DIM);
-        mvprintw(row, 38, "%s", hints[i]);
+        if (i == SETTING_AUDIO_DEV) {
+            int idx = audio_dev_idx();
+            if (audio_dev_count == 0)
+                mvprintw(row, 44, "no capture devices detected");
+            else if (idx >= 0 && audio_dev_descs[idx][0])
+                mvprintw(row, 44, "<-> cycle  %.30s", audio_dev_descs[idx]);
+            else
+                mvprintw(row, 44, "%s", base_hints[i]);
+        } else if (i == SETTING_AUDIO_ENABLE && audio.errmsg[0]) {
+            mvprintw(row, 44, "%.34s", audio.errmsg);
+        } else {
+            mvprintw(row, 44, "%s", base_hints[i]);
+        }
         attroff(A_DIM);
     }
 }
@@ -520,21 +597,42 @@ static void handle_settings_key(int ch)
             idx = right ? (idx + 1) % SCAN_STEP_COUNT
                         : (idx + SCAN_STEP_COUNT - 1) % SCAN_STEP_COUNT;
             config.scan_step_hz = scan_steps[idx];
+            config_save(&config);
         } else if (settings_sel == SETTING_THRESHOLD) {
             int p = config.signal_threshold_pct + (right ? 5 : -5);
             if (p <  5) p =  5;
             if (p > 95) p = 95;
             config.signal_threshold_pct = p;
+            config_save(&config);
         } else if (settings_sel == SETTING_RDS_NAMES) {
             config.rds_names = !config.rds_names;
+            config_save(&config);
+        } else if (settings_sel == SETTING_AUDIO_ENABLE) {
+            config.audio_enabled = !config.audio_enabled;
+            audio_apply();
+            config_save(&config);
+        } else if (settings_sel == SETTING_AUDIO_DEV) {
+            if (audio_dev_count > 0) {
+                int idx = audio_dev_idx();
+                idx = right ? (idx + 1) % audio_dev_count
+                            : (idx + audio_dev_count - 1) % audio_dev_count;
+                strncpy(config.audio_device, audio_dev_names[idx], 63);
+                config.audio_device[63] = '\0';
+                if (config.audio_enabled)
+                    audio_start(&audio, config.audio_device);
+                config_save(&config);
+            }
         }
-        config_save(&config);
         break;
     }
 
     case '\n': case KEY_ENTER:
         if (settings_sel == SETTING_RDS_NAMES) {
             config.rds_names = !config.rds_names;
+            config_save(&config);
+        } else if (settings_sel == SETTING_AUDIO_ENABLE) {
+            config.audio_enabled = !config.audio_enabled;
+            audio_apply();
             config_save(&config);
         }
         break;
@@ -766,6 +864,13 @@ int main(int argc, char *argv[])
 
     config_load(&config);
 
+    /* Enumerate ALSA capture devices for the settings panel */
+    audio_enum_devices(audio_dev_names, audio_dev_descs,
+                       &audio_dev_count, AUDIO_DEV_MAX);
+
+    /* Start audio pipe if enabled */
+    audio_apply();
+
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
 
@@ -831,6 +936,7 @@ int main(int argc, char *argv[])
     if (mode == M_SCANNING) finish_scan(0);
 
     endwin();
+    audio_stop(&audio);
     radio_close(&radio);
     return 0;
 }
