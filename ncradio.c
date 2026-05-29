@@ -42,7 +42,8 @@ static Mode mode = M_NORMAL;
 
 static int preset_sel    = 0;
 static int list_offset   = 0;  /* row offset (not entry offset) for the preset grid */
-static int preset_ncols  = 1;  /* column count last computed by draw_presets */
+static int preset_ncols       = 1;  /* column count, set by draw_presets */
+static int preset_rows_per_col = 1;  /* rows per column, set by draw_presets */
 static int signal_pct    = 0;
 
 /* tuning input */
@@ -372,6 +373,7 @@ static void draw_presets(void)
        spilling into the next.  Item i sits at visual row (i % rows_per_col)
        and column (i / rows_per_col). */
     int rows_per_col = (count + ncols - 1) / ncols;
+    preset_rows_per_col = rows_per_col;
     int vis_rows     = rows - 1;
     int item_row     = preset_sel % rows_per_col;
 
@@ -440,7 +442,7 @@ static void draw_help(void)
         mvprintw(y + 1, 2,
                  "s:scan  ,:step<  .:step>  t:tune  m:mute  +/-:vol  a:add  d:del  e:rename  o:settings");
         mvprintw(y + 2, 2,
-                 "Up/Dn:select preset   Enter:tune to preset   q:quit");
+                 "Up/Dn:row  Left/Right:col  Enter:tune to preset   q:quit");
         break;
     }
     attroff(A_DIM);
@@ -609,14 +611,25 @@ static void handle_key(int ch)
             break;
 
         /* Step frequency by the configured scan step */
-        case ',': case KEY_LEFT:
+        case ',':
             radio_set_freq(&radio, radio.freq_hz - config.scan_step_hz);
             signal_pct = radio_get_signal(&radio);
             break;
 
-        case '.': case KEY_RIGHT:
+        case '.':
             radio_set_freq(&radio, radio.freq_hz + config.scan_step_hz);
             signal_pct = radio_get_signal(&radio);
+            break;
+
+        /* Arrow keys navigate the preset grid (column-major) */
+        case KEY_LEFT:
+            preset_sel -= preset_rows_per_col;
+            if (preset_sel < 0) preset_sel = 0;
+            break;
+
+        case KEY_RIGHT:
+            preset_sel += preset_rows_per_col;
+            if (preset_sel >= config.count) preset_sel = config.count - 1;
             break;
 
         case 't':
