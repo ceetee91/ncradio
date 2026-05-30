@@ -392,7 +392,9 @@ written to `~/.ncradio.conf` on every adjustment.
 | Signal threshold | 30% | 5% – 95% (5% steps) | Minimum signal strength to record a station during scan/seek |
 | Save RDS names | Yes | Yes / No | Whether to pause on each found station to collect its RDS PS name during scan |
 | Audio output | Off | Off / On | Enable or disable the audio pipe |
-| Audio device | (auto) | detected capture devices | Capture device / PipeWire source node |
+| Capture device | (auto) | detected capture devices | Capture device / PipeWire source node |
+| Playback device | (default) | detected playback devices | Playback device / PipeWire sink node; empty = system default |
+| Buffer size | 1024 frames | 512 / 1024 / 2048 / 4096 / 8192 frames | Capture period size hint (ALSA backend; ignored by PipeWire) |
 | Mute while scanning | Yes | Yes / No | Stop the audio pipe during a band scan |
 | Mute while seeking | Yes | Yes / No | Stop the audio pipe while seeking |
 | Record bitrate | 128 kbps | 64 / 96 / 128 / 192 / 256 / 320 kbps | MP3 bitrate for recordings (shown only when lame is compiled in) |

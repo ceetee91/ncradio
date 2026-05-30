@@ -422,20 +422,22 @@ LINES-1        second help line (M_NORMAL only)
 - `[A!]` red — pipe stopped with an error (error text visible in settings panel)
 - absent — audio disabled in config
 
-**Settings panel** (`draw_settings()`) — seven rows when only audio is compiled
-in; ten rows when both audio and lame are present:
+**Settings panel** (`draw_settings()`) — ten rows when only audio is compiled
+in; thirteen rows when both audio and lame are present:
 
 ```
 Row +2   Scan step:            0.10 MHz         <- -> to cycle
 Row +3   Signal threshold:     30%              <- -> to adjust (5% steps)
 Row +4   Save RDS names:       Yes              <- -> or Enter to toggle
 Row +5   Audio output:         On (48000Hz 2ch) <- -> or Enter to toggle
-Row +6   Audio device:         <node name>      <- -> to cycle  <description>
-Row +7   Mute while scanning:  Yes              <- -> or Enter to toggle
-Row +8   Mute while seeking:   Yes              <- -> or Enter to toggle
-Row +9   Record bitrate:       128 kbps         <- -> to cycle        ← HAVE_LAME
-Row +10  Record channels:      Stereo           <- -> to toggle       ← HAVE_LAME
-Row +11  Record sample rate:   44100 Hz         <- -> to cycle        ← HAVE_LAME
+Row +6   Audio device:         <node name>      <- -> to cycle
+Row +7   Playback device:      (default)        <- -> to cycle
+Row +8   Buffer size:          1024 frames      <- -> to cycle
+Row +9   Mute while scanning:  Yes              <- -> or Enter to toggle
+Row +10  Mute while seeking:   Yes              <- -> or Enter to toggle
+Row +11  Record bitrate:       128 kbps         <- -> to cycle        ← HAVE_LAME
+Row +12  Record channels:      Stereo           <- -> to toggle       ← HAVE_LAME
+Row +13  Record sample rate:   44100 Hz         <- -> to cycle        ← HAVE_LAME
 ```
 
 **`audio_apply()`** — called on startup and whenever audio settings change:
