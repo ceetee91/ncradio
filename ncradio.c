@@ -469,20 +469,8 @@ static void draw_settings(void)
 
         attron(A_DIM);
 #ifdef HAVE_AUDIO
-        if (i == SETTING_AUDIO_DEV) {
-            int idx = audio_dev_idx();
-            if (audio_dev_count == 0)
-                mvprintw(row, 44, "no capture devices detected");
-            else if (idx >= 0 && audio_dev_descs[idx][0])
-                mvprintw(row, 44, "<-> cycle  %.30s", audio_dev_descs[idx]);
-            else
-                mvprintw(row, 44, "%s", base_hints[i]);
-        } else if (i == SETTING_AUDIO_PLAY_DEV) {
-            int idx = audio_play_dev_idx();
-            if (idx >= 0 && idx < audio_play_dev_count && audio_play_dev_descs[idx][0])
-                mvprintw(row, 44, "<-> cycle  %.30s", audio_play_dev_descs[idx]);
-            else
-                mvprintw(row, 44, "%s", base_hints[i]);
+        if (i == SETTING_AUDIO_DEV || i == SETTING_AUDIO_PLAY_DEV) {
+            /* no hint — leave space for the full device name */
         } else if (i == SETTING_AUDIO_ENABLE && audio.errmsg[0]) {
             mvprintw(row, 44, "%.34s", audio.errmsg);
         } else {
