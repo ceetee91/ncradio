@@ -1059,6 +1059,8 @@ int main(int argc, char *argv[])
 
     if (mode == M_SCANNING) finish_scan();
 
+    radio_mute(&radio, 1);
+
     config.volume = radio.volume;
     config.last_freq_hz = radio.freq_hz;
     config_save(&config);
