@@ -64,6 +64,20 @@ sudo make install
 ```sh
 ./ncradio              # uses /dev/radio0
 ./ncradio /dev/radio1  # alternate device
+./ncradio -v           # print version and build configuration, then exit
+./ncradio --version    # same
+```
+
+The version output includes the build date/time and, for each optional
+component, whether it was compiled in and which library version was linked:
+
+```
+ncradio 0.1
+Built:  May 30 2026 11:45:19
+
+  Audio (ALSA):          yes — libasound 1.2.15.3
+  ALSA autodetect:       udev + sysfs — libudev 259
+  MP3 recording (lame):  yes — lame 3.100
 ```
 
 The tuner device must be readable and writable by the current user. On most

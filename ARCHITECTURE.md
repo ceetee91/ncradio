@@ -111,6 +111,10 @@ virtual plugins (`default`, `dmix`, `null`, etc.).
 then spawns the thread. **`audio_stop`** is idempotent and safe to call when no
 thread is running.
 
+**`audio_alsa_version()`** returns `snd_asoundlib_version()`, exposing the
+runtime ALSA version to `ncradio.c` without requiring it to include
+`<alsa/asoundlib.h>` directly.
+
 **Thread safety** — `a->rate` and `a->channels` are written once by the thread
 during startup, then only read by the UI thread for display. The benign data
 race on these `int`-sized fields is acceptable; they are informational only.
@@ -394,6 +398,14 @@ Row +11  Record sample rate:   44100 Hz         <- -> to cycle        ← HAVE_L
   unlocks, then calls `record_close` — guaranteeing the audio thread is not
   mid-callback when `record_close` frees the encoder.
 
+**`-v` / `--version`** — `print_version()` is called before `radio_open` if
+either flag appears in `argv`. It prints the version string, `__DATE__` /
+`__TIME__` build timestamp, and one line per optional component:
+- Audio: `audio_alsa_version()` (runtime `snd_asoundlib_version()`)
+- udev: `LIBUDEV_VERSION` macro embedded at compile time by `configure` via
+  `pkg-config --modversion libudev`; omitted from the line if unavailable
+- lame: `get_lame_version()` (runtime)
+
 **Exit sequence** (`main()` after the event loop):
 
 1. If still in scan mode, `finish_scan`.
@@ -489,6 +501,10 @@ accommodate new optional dependencies.
 
 When lame is found, `HAVE_LAME` is added to `AUDIO_CFLAGS`, `-lmp3lame` to
 `AUDIO_LIBS`, and `record.c` to `RECORD_SRCS`.
+
+When udev is found, `configure` also runs `pkg-config --modversion libudev`
+and, if successful, appends `-DLIBUDEV_VERSION=\"<ver>\"` to `AUDIO_CFLAGS`.
+This is the only component whose version has no runtime query API.
 
 Compiled with `-Wall -Wextra -O2 -D_POSIX_C_SOURCE=199309L`. Linked against
 `-lncurses -lpthread -lasound` (plus `-ludev` and/or `-lmp3lame` as detected).
