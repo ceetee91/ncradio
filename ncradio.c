@@ -294,7 +294,7 @@ static void draw_settings(void)
         "Save RDS names:",
 #ifdef HAVE_AUDIO
         "Audio output:",
-        "Audio device:",
+        "Tuner device:",
         "Mute while scanning:",
         "Mute while seeking:",
 #endif
