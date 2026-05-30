@@ -3,12 +3,14 @@
 
 AUDIO=auto
 UDEV=auto
+LAME=auto
 
 for arg in "$@"; do
     case "$arg" in
         --disable-audio) AUDIO=no ;;
         --enable-audio)  AUDIO=yes ;;
         --disable-udev)  UDEV=no ;;
+        --disable-lame)  LAME=no ;;
         --help|-h)
             cat <<EOF
 Usage: ./configure [OPTION]...
@@ -17,6 +19,7 @@ Options:
   --disable-audio   Build without ALSA audio support
   --enable-audio    Require ALSA audio support (fail if not found)
   --disable-udev    Disable libudev; use sysfs-only ALSA autodetection
+  --disable-lame    Build without MP3 recording support
   --help            Show this help
 
 Without options, audio support is enabled automatically if libasound is found.
@@ -86,6 +89,24 @@ EOF
     fi
 fi
 
+have_lame=no
+
+if [ "$have_audio" = "yes" ] && [ "$LAME" != "no" ]; then
+    printf "checking for libmp3lame... "
+    _tmpdir=$(mktemp -d)
+    cat > "$_tmpdir/check.c" <<'EOF'
+#include <lame/lame.h>
+int main(void) { lame_global_flags *l = lame_init(); lame_close(l); return 0; }
+EOF
+    if ${CC:-gcc} "$_tmpdir/check.c" -lmp3lame -o "$_tmpdir/check" 2>/dev/null; then
+        have_lame=yes
+        echo "yes"
+    else
+        echo "no"
+    fi
+    rm -rf "$_tmpdir"
+fi
+
 # Build flag strings
 if [ "$have_audio" = "yes" ]; then
     audio_cflags="-DHAVE_AUDIO"
@@ -94,11 +115,17 @@ if [ "$have_audio" = "yes" ]; then
         audio_cflags="$audio_cflags -DHAVE_UDEV"
         audio_libs="$audio_libs -ludev"
     fi
+    if [ "$have_lame" = "yes" ]; then
+        audio_cflags="$audio_cflags -DHAVE_LAME"
+        audio_libs="$audio_libs -lmp3lame"
+    fi
     audio_srcs="audio.c"
+    record_srcs=$([ "$have_lame" = "yes" ] && echo "record.c")
 else
     audio_cflags=""
     audio_libs=""
     audio_srcs=""
+    record_srcs=""
 fi
 
 cat > config.mk <<EOF
@@ -107,6 +134,7 @@ HAVE_AUDIO   = $([ "$have_audio" = "yes" ] && echo 1 || echo 0)
 AUDIO_CFLAGS = $audio_cflags
 AUDIO_SRCS   = $audio_srcs
 AUDIO_LIBS   = $audio_libs
+RECORD_SRCS  = $record_srcs
 EOF
 
 echo ""
@@ -116,6 +144,8 @@ printf "  Audio (ALSA): "
 if [ "$have_audio" = "yes" ]; then
     printf "  ALSA autodetect via: "
     [ "$have_udev" = "yes" ] && echo "udev + sysfs fallback" || echo "sysfs"
+    printf "  MP3 recording:        "
+    [ "$have_lame" = "yes" ] && echo "enabled" || echo "disabled (libmp3lame not found)"
 fi
 echo ""
 echo "Run 'make' to build."

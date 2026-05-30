@@ -13,6 +13,13 @@ typedef struct {
     unsigned int rate;       /* detected sample rate (set by thread) */
     int          channels;   /* detected channel count (set by thread) */
     char         errmsg[128];/* last error; empty if none */
+
+    /* Recording hook — protected by rec_lock.
+       The audio thread calls rec_fn(rec_ctx, pcm, frames, channels) after
+       each capture period when rec_fn is non-NULL. */
+    pthread_mutex_t rec_lock;
+    void (*rec_fn)(void *ctx, const short *pcm, int frames, int channels);
+    void  *rec_ctx;
 } Audio;
 
 /* Start audio pipe: capture from device → playback on "default".

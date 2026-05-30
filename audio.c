@@ -121,6 +121,11 @@ static void *audio_fn(void *arg)
         snd_pcm_sframes_t w = snd_pcm_writei(play, buf, (snd_pcm_uframes_t)n);
         if (w < 0)
             snd_pcm_recover(play, (int)w, 1);
+
+        pthread_mutex_lock(&a->rec_lock);
+        if (a->rec_fn)
+            a->rec_fn(a->rec_ctx, buf, (int)n, a->channels);
+        pthread_mutex_unlock(&a->rec_lock);
     }
 
 done:
@@ -141,6 +146,7 @@ int audio_start(Audio *a, const char *device)
     a->errmsg[0] = '\0';
     a->rate      = 0;
     a->channels  = 0;
+    pthread_mutex_init(&a->rec_lock, NULL);
     a->running   = 1;
     a->started   = 1;
     if (pthread_create(&a->thread, NULL, audio_fn, a) != 0) {

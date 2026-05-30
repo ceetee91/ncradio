@@ -13,6 +13,11 @@
 #define DEFAULT_AUDIO_MUTE_SCAN          1
 #define DEFAULT_AUDIO_MUTE_SEEK          1
 
+/* Default MP3 recording settings */
+#define DEFAULT_RECORD_BITRATE         128   /* kbps */
+#define DEFAULT_RECORD_STEREO            1   /* 1=stereo 0=mono */
+#define DEFAULT_RECORD_SAMPLERATE    44100   /* Hz */
+
 typedef struct {
     /* stations */
     uint32_t freqs[MAX_PRESETS];
@@ -35,6 +40,11 @@ typedef struct {
     char     audio_device[64]; /* ALSA capture device, e.g. "hw:2,0" */
     int      audio_mute_scan;  /* stop audio pipe while scanning */
     int      audio_mute_seek;  /* stop audio pipe while seeking */
+
+    /* MP3 recording settings */
+    int      record_bitrate;    /* kbps: 64/96/128/192/256/320 */
+    int      record_stereo;     /* 1=stereo 0=mono */
+    int      record_samplerate; /* Hz: 22050/44100/48000 */
 } Config;
 
 int  config_load(Config *c);

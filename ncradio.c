@@ -14,6 +14,9 @@
 #ifdef HAVE_AUDIO
 #include "audio.h"
 #endif
+#ifdef HAVE_LAME
+#include "record.h"
+#endif
 
 #define VERSION "0.1"
 
@@ -36,7 +39,10 @@
 #define CP_SCAN    7
 #define CP_CUR     8
 
-typedef enum { M_NORMAL, M_TUNING, M_SCANNING, M_EDITING, M_SETTINGS, M_SEEKING } Mode;
+typedef enum {
+    M_NORMAL, M_TUNING, M_SCANNING, M_EDITING, M_SETTINGS, M_SEEKING,
+    M_RECORD_NAME, M_RECORDING
+} Mode;
 
 static Radio       radio;
 static Config      config;
@@ -68,14 +74,21 @@ static int settings_sel = 0;
 #define SETTING_AUDIO_DEV       4
 #define SETTING_AUDIO_MUTE_SCAN 5
 #define SETTING_AUDIO_MUTE_SEEK 6
+#ifdef HAVE_LAME
+#define SETTING_REC_BITRATE     7
+#define SETTING_REC_STEREO      8
+#define SETTING_REC_SAMPLERATE  9
+#define SETTING_COUNT           10
+#else
 #define SETTING_COUNT           7
+#endif
 #else
 #define SETTING_COUNT           3
 #endif
 
 #ifdef HAVE_AUDIO
 /* audio state and enumerated capture devices */
-static Audio audio;
+static Audio audio = { .rec_lock = PTHREAD_MUTEX_INITIALIZER };
 static char  audio_dev_names[AUDIO_DEV_MAX][AUDIO_DEV_NAMELEN];
 static char  audio_dev_descs[AUDIO_DEV_MAX][AUDIO_DEV_DESCLEN];
 static int   audio_dev_count = 0;
@@ -126,6 +139,31 @@ static void set_msg(const char *msg)
     status_msg[sizeof(status_msg) - 1] = '\0';
     status_msg_exp = time(NULL) + 3;
 }
+
+#ifdef HAVE_LAME
+/* recording state */
+static char   rec_name_buf[256];
+static int    rec_name_len = 0;
+static time_t rec_start_time = 0;
+
+static void recording_cb(void *ctx, const short *pcm, int frames, int channels)
+{
+    (void)channels;
+    record_feed((Record *)ctx, pcm, frames);
+}
+
+static void recording_stop(void)
+{
+    pthread_mutex_lock(&audio.rec_lock);
+    Record *r = audio.rec_ctx;
+    audio.rec_fn  = NULL;
+    audio.rec_ctx = NULL;
+    pthread_mutex_unlock(&audio.rec_lock);
+    record_close(r);
+    mode = M_NORMAL;
+    set_msg("Recording saved.");
+}
+#endif /* HAVE_LAME */
 
 static void draw_bar(int y, int x, int w, int pct, int cp)
 {
@@ -260,6 +298,20 @@ static void draw_info(void)
         mvprintw(ROW_INFO, 2, "Seeking %s ...",
                  radio.seek_fwd ? "forward >" : "backward <");
         attroff(COLOR_PAIR(CP_SCAN) | A_BOLD);
+#ifdef HAVE_LAME
+    } else if (mode == M_RECORD_NAME) {
+        attron(A_BOLD);
+        mvprintw(ROW_INFO, 2, "Record file: %.*s_",
+                 (int)(sizeof(rec_name_buf) - 1), rec_name_buf);
+        attroff(A_BOLD);
+    } else if (mode == M_RECORDING) {
+        long elapsed = (long)(time(NULL) - rec_start_time);
+        attron(COLOR_PAIR(CP_SIG_LO) | A_BOLD);
+        mvprintw(ROW_INFO, 2, "● REC %ld:%02ld  %.*s",
+                 elapsed / 60, elapsed % 60,
+                 COLS - 16, rec_name_buf);
+        attroff(COLOR_PAIR(CP_SIG_LO) | A_BOLD);
+#endif
     } else {
         /* M_NORMAL / M_SETTINGS / M_EDITING — timed msg then RDS RT */
         if (status_msg[0] && time(NULL) < status_msg_exp) {
@@ -297,6 +349,11 @@ static void draw_settings(void)
         "Tuner device:",
         "Mute while scanning:",
         "Mute while seeking:",
+#ifdef HAVE_LAME
+        "Record bitrate:",
+        "Record channels:",
+        "Record sample rate:",
+#endif
 #endif
     };
     static const char *base_hints[SETTING_COUNT] = {
@@ -308,6 +365,11 @@ static void draw_settings(void)
         "<- -> to cycle",
         "<- -> or Enter to toggle",
         "<- -> or Enter to toggle",
+#ifdef HAVE_LAME
+        "<- -> to cycle",
+        "<- -> to toggle",
+        "<- -> to cycle",
+#endif
 #endif
     };
 
@@ -354,6 +416,18 @@ static void draw_settings(void)
             snprintf(valstr, sizeof(valstr), "%s",
                      config.audio_mute_seek ? "Yes" : "No");
             break;
+#ifdef HAVE_LAME
+        case SETTING_REC_BITRATE:
+            snprintf(valstr, sizeof(valstr), "%d kbps", config.record_bitrate);
+            break;
+        case SETTING_REC_STEREO:
+            snprintf(valstr, sizeof(valstr), "%s",
+                     config.record_stereo ? "Stereo" : "Mono");
+            break;
+        case SETTING_REC_SAMPLERATE:
+            snprintf(valstr, sizeof(valstr), "%d Hz", config.record_samplerate);
+            break;
+#endif
 #endif
         }
 
@@ -569,8 +643,26 @@ static void draw_help(void)
         mvprintw(y + 1, 2,
                  "s:scan  ,:step-  .:step+  <:seek-  >:seek+  t:tune  m:mute  +/-:vol");
         mvprintw(y + 2, 2,
-                 "a:add  d:del  e:rename  o:settings  Up/Dn  Left/Right:navigate  Enter:tune  q:quit");
+#ifdef HAVE_LAME
+                 "a:add  d:del  e:rename  r:record  o:settings  arrows:navigate  Enter:tune  q:quit"
+#else
+                 "a:add  d:del  e:rename  o:settings  Up/Dn  Left/Right:navigate  Enter:tune  q:quit"
+#endif
+                 );
         break;
+#ifdef HAVE_LAME
+    case M_RECORD_NAME:
+        mvprintw(y + 1, 2,
+                 "Type filename   Enter:start recording   Esc:cancel   Bksp:delete");
+        break;
+    case M_RECORDING:
+        mvprintw(y + 1, 2, "s or Esc: stop recording and save");
+        break;
+#else
+    case M_RECORD_NAME:
+    case M_RECORDING:
+        break;
+#endif
     }
     attroff(A_DIM);
 }
@@ -688,6 +780,29 @@ static void handle_settings_key(int ch)
         } else if (settings_sel == SETTING_AUDIO_MUTE_SEEK) {
             config.audio_mute_seek = !config.audio_mute_seek;
             config_save(&config);
+#ifdef HAVE_LAME
+        } else if (settings_sel == SETTING_REC_BITRATE) {
+            static const int bitrates[] = { 64, 96, 128, 192, 256, 320 };
+            static const int nb = 6;
+            int idx = 0;
+            for (int i = 0; i < nb; i++)
+                if (bitrates[i] == config.record_bitrate) { idx = i; break; }
+            idx = right ? (idx + 1) % nb : (idx + nb - 1) % nb;
+            config.record_bitrate = bitrates[idx];
+            config_save(&config);
+        } else if (settings_sel == SETTING_REC_STEREO) {
+            config.record_stereo = !config.record_stereo;
+            config_save(&config);
+        } else if (settings_sel == SETTING_REC_SAMPLERATE) {
+            static const int rates[] = { 22050, 44100, 48000 };
+            static const int nr = 3;
+            int idx = 0;
+            for (int i = 0; i < nr; i++)
+                if (rates[i] == config.record_samplerate) { idx = i; break; }
+            idx = right ? (idx + 1) % nr : (idx + nr - 1) % nr;
+            config.record_samplerate = rates[idx];
+            config_save(&config);
+#endif
 #endif
         }
         break;
@@ -708,6 +823,11 @@ static void handle_settings_key(int ch)
         } else if (settings_sel == SETTING_AUDIO_MUTE_SEEK) {
             config.audio_mute_seek = !config.audio_mute_seek;
             config_save(&config);
+#ifdef HAVE_LAME
+        } else if (settings_sel == SETTING_REC_STEREO) {
+            config.record_stereo = !config.record_stereo;
+            config_save(&config);
+#endif
 #endif
         }
         break;
@@ -794,6 +914,66 @@ static void handle_key(int ch)
         else if (ch == 27) cancel_scan();
         break;
 
+#ifdef HAVE_LAME
+    case M_RECORD_NAME:
+        if (ch == '\n' || ch == KEY_ENTER) {
+            if (rec_name_len == 0) {
+                mode = M_NORMAL;
+                break;
+            }
+            /* Append .mp3 if not already present */
+            if (rec_name_len < 4 ||
+                strcmp(rec_name_buf + rec_name_len - 4, ".mp3") != 0) {
+                if (rec_name_len + 4 < (int)sizeof(rec_name_buf)) {
+                    memcpy(rec_name_buf + rec_name_len, ".mp3", 5);
+                    rec_name_len += 4;
+                }
+            }
+            char errmsg[128] = "";
+            int in_rate = audio.rate > 0 ? (int)audio.rate : 44100;
+            int in_ch   = audio.channels > 0 ? audio.channels : 2;
+            Record *r = record_open(rec_name_buf,
+                                    in_rate, in_ch,
+                                    config.record_samplerate,
+                                    config.record_stereo ? 2 : 1,
+                                    config.record_bitrate,
+                                    errmsg, sizeof(errmsg));
+            if (!r) {
+                set_msg(errmsg[0] ? errmsg : "Cannot open recording file");
+                mode = M_NORMAL;
+                break;
+            }
+            pthread_mutex_lock(&audio.rec_lock);
+            audio.rec_ctx = r;
+            audio.rec_fn  = recording_cb;
+            pthread_mutex_unlock(&audio.rec_lock);
+            rec_start_time = time(NULL);
+            mode = M_RECORDING;
+        } else if (ch == 27) {
+            rec_name_len = 0; rec_name_buf[0] = '\0';
+            mode = M_NORMAL;
+        } else if ((ch == KEY_BACKSPACE || ch == 127 || ch == '\b') && rec_name_len > 0) {
+            rec_name_buf[--rec_name_len] = '\0';
+        } else if (isprint(ch) && rec_name_len < (int)sizeof(rec_name_buf) - 5) {
+            rec_name_buf[rec_name_len++] = (char)ch;
+            rec_name_buf[rec_name_len]   = '\0';
+        }
+        break;
+
+    case M_RECORDING:
+        if (ch == 27 || ch == 's') {
+            recording_stop();
+        } else if (ch == 'q') {
+            recording_stop();
+            running = 0;
+        }
+        break;
+#else
+    case M_RECORD_NAME:
+    case M_RECORDING:
+        break;
+#endif
+
     case M_NORMAL:
         switch (ch) {
         case 'q': case 'Q':
@@ -871,6 +1051,17 @@ static void handle_key(int ch)
             mode = M_SETTINGS;
             settings_sel = 0;
             break;
+
+#ifdef HAVE_LAME
+        case 'r':
+            if (!audio.running) {
+                set_msg("Enable audio first to record.");
+                break;
+            }
+            rec_name_len = 0; rec_name_buf[0] = '\0';
+            mode = M_RECORD_NAME;
+            break;
+#endif
 
         case '+': case '=':
             radio_set_volume(&radio, radio.volume + 5);

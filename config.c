@@ -35,6 +35,9 @@ int config_load(Config *c)
     c->audio_enabled        = DEFAULT_AUDIO_ENABLED;
     c->audio_mute_scan      = DEFAULT_AUDIO_MUTE_SCAN;
     c->audio_mute_seek      = DEFAULT_AUDIO_MUTE_SEEK;
+    c->record_bitrate       = DEFAULT_RECORD_BITRATE;
+    c->record_stereo        = DEFAULT_RECORD_STEREO;
+    c->record_samplerate    = DEFAULT_RECORD_SAMPLERATE;
 
     FILE *f = fopen(path(), "r");
     if (!f) return 0;
@@ -58,6 +61,9 @@ int config_load(Config *c)
             else if (strcmp(key, "audio_enabled")     == 0) c->audio_enabled = ival ? 1 : 0;
             else if (strcmp(key, "audio_mute_scan")   == 0) c->audio_mute_scan = ival ? 1 : 0;
             else if (strcmp(key, "audio_mute_seek")   == 0) c->audio_mute_seek = ival ? 1 : 0;
+            else if (strcmp(key, "record_bitrate")    == 0) c->record_bitrate = ival;
+            else if (strcmp(key, "record_stereo")     == 0) c->record_stereo = ival ? 1 : 0;
+            else if (strcmp(key, "record_samplerate") == 0) c->record_samplerate = ival;
             else if (strcmp(key, "audio_device")      == 0) {
                 strncpy(c->audio_device, sval, sizeof(c->audio_device) - 1);
                 c->audio_device[sizeof(c->audio_device) - 1] = '\0';
@@ -102,8 +108,11 @@ int config_save(const Config *c)
     if (c->last_freq_hz)
         fprintf(f, "last_freq=%u\n",    c->last_freq_hz);
     fprintf(f, "audio_enabled=%d\n",    c->audio_enabled);
-    fprintf(f, "audio_mute_scan=%d\n", c->audio_mute_scan);
-    fprintf(f, "audio_mute_seek=%d\n", c->audio_mute_seek);
+    fprintf(f, "audio_mute_scan=%d\n",     c->audio_mute_scan);
+    fprintf(f, "audio_mute_seek=%d\n",     c->audio_mute_seek);
+    fprintf(f, "record_bitrate=%d\n",      c->record_bitrate);
+    fprintf(f, "record_stereo=%d\n",       c->record_stereo);
+    fprintf(f, "record_samplerate=%d\n",   c->record_samplerate);
     if (c->audio_device[0])
         fprintf(f, "audio_device=%s\n", c->audio_device);
     fprintf(f, "# stations\n");
