@@ -2,11 +2,13 @@
 # configure — detect build-time options and generate config.mk
 
 AUDIO=auto
+UDEV=auto
 
 for arg in "$@"; do
     case "$arg" in
         --disable-audio) AUDIO=no ;;
         --enable-audio)  AUDIO=yes ;;
+        --disable-udev)  UDEV=no ;;
         --help|-h)
             cat <<EOF
 Usage: ./configure [OPTION]...
@@ -14,6 +16,7 @@ Usage: ./configure [OPTION]...
 Options:
   --disable-audio   Build without ALSA audio support
   --enable-audio    Require ALSA audio support (fail if not found)
+  --disable-udev    Disable libudev; use sysfs-only ALSA autodetection
   --help            Show this help
 
 Without options, audio support is enabled automatically if libasound is found.
@@ -61,7 +64,7 @@ fi
 
 have_udev=no
 
-if [ "$have_audio" = "yes" ]; then
+if [ "$have_audio" = "yes" ] && [ "$UDEV" != "no" ]; then
     printf "checking for libudev... "
 
     if pkg-config --exists libudev 2>/dev/null; then
