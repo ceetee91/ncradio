@@ -324,7 +324,7 @@ static void draw_info(void)
     } else if (mode == M_RECORDING) {
         long elapsed = (long)(time(NULL) - rec_start_time);
         attron(COLOR_PAIR(CP_SIG_LO) | A_BOLD);
-        mvprintw(ROW_INFO, 2, "● REC %ld:%02ld  %.*s",
+        mvprintw(ROW_INFO, 2, "- REC %ld:%02ld  %.*s",
                  elapsed / 60, elapsed % 60,
                  COLS - 16, rec_name_buf);
         attroff(COLOR_PAIR(CP_SIG_LO) | A_BOLD);
@@ -590,7 +590,7 @@ static void draw_presets(void)
     if (count == 0) {
         attron(A_DIM);
         mvprintw(top + 1, 4,
-                 "(none — press 's' to scan or 'a' to add current frequency)");
+                 "(nothing here! press 's' to scan or 'a' to add current frequency)");
         attroff(A_DIM);
         return;
     }
@@ -759,7 +759,7 @@ static void finish_scan(void)
 
     char msg[96];
     snprintf(msg, sizeof(msg),
-             "Scan done — found %d station%s, saved to ~/.ncradio.conf",
+             "scan done. found %d station%s, saved to ~/.ncradio.conf",
              config.count, config.count == 1 ? "" : "s");
     set_msg(msg);
 }
@@ -917,7 +917,7 @@ static void handle_key(int ch)
             } else if (tune_len > 0) {
                 char errmsg[64];
                 snprintf(errmsg, sizeof(errmsg),
-                         "Invalid frequency — enter %.2f to %.2f",
+                         "invalid frequency - enter %.2f to %.2f",
                          min_mhz, max_mhz);
                 set_msg(errmsg);
             }
@@ -1204,34 +1204,34 @@ static void on_signal(int sig) { (void)sig; running = 0; }
 
 static void print_version(void)
 {
-    printf("ncradio " VERSION "\n");
-    printf("Built:  " __DATE__ " " __TIME__ "\n\n");
+    printf("ncradio " VERSION " built on " __DATE__ " " __TIME__ "\n");
+    printf("by Constantinos Tsakiris\n\n");
 
 #ifdef HAVE_PIPEWIRE
     printf("  Audio backend:         PipeWire %s\n",
            audio_pipewire_version());
 #elif defined(HAVE_AUDIO)
-    printf("  Audio backend:         ALSA — libasound %s\n",
+    printf("  Audio backend:         ALSA (libasound %s)\n",
            audio_alsa_version());
 #else
-    printf("  Audio backend:         disabled\n");
+    printf("  Audio backend:         disabled (tuner only)\n");
 #endif
 
 #ifdef HAVE_UDEV
 # ifdef LIBUDEV_VERSION
-    printf("  Device autodetect:     udev + sysfs — libudev %s\n",
+    printf("  Device autodetect:     libudev %s + sysfs\n",
            LIBUDEV_VERSION);
 # else
-    printf("  Device autodetect:     udev + sysfs\n");
+    printf("  Device autodetect:     libudev + sysfs\n");
 # endif
 #elif defined(HAVE_AUDIO)
     printf("  Device autodetect:     sysfs only\n");
 #endif
 
 #ifdef HAVE_LAME
-    printf("  MP3 recording (lame):  yes — lame %s\n", get_lame_version());
+    printf("  MP3 recording:         lame %s\n", get_lame_version());
 #else
-    printf("  MP3 recording (lame):  no\n");
+    printf("  MP3 recording:         not supported\n");
 #endif
 }
 

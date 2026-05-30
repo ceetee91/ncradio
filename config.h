@@ -12,7 +12,7 @@
 #define DEFAULT_AUDIO_ENABLED            0
 #define DEFAULT_AUDIO_MUTE_SCAN          1
 #define DEFAULT_AUDIO_MUTE_SEEK          1
-#define DEFAULT_AUDIO_BUFFER_FRAMES   4096  /* capture/playback period in frames */
+#define DEFAULT_AUDIO_BUFFER_FRAMES   1024  /* capture/playback period in frames */
 
 /* Default MP3 recording settings */
 #define DEFAULT_RECORD_BITRATE         128   /* kbps */

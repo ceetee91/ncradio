@@ -89,9 +89,13 @@ rec_ctx       — opaque pointer passed to rec_fn
 | `ncradio-cap` | `PW_DIRECTION_INPUT` | `Audio/Source` node (radio card) |
 | `ncradio` | `PW_DIRECTION_OUTPUT` | `Audio/Sink` node (speakers) |
 
-Both streams propose S16\_LE stereo 48 kHz. PipeWire negotiates format with
-each hardware node independently and resamples as needed. `a->rate = 48000`
-and `a->channels = 2` are set before the loop starts.
+The capture stream proposes S16\_LE with an open rate range
+(`SPA_POD_CHOICE_RANGE_Int(48000, 8000, 384000)`) so PipeWire selects the
+source's native sample rate — no resample on the capture side. The playback
+stream is connected from `pw_cap_param_changed` once the capture format is
+negotiated, using the same rate, limiting total resampling to at most one hop
+(source native → sink native). `a->rate` and `a->channels` are written in
+`pw_cap_param_changed` when the capture format is first negotiated.
 
 **Data path:**
 
@@ -113,9 +117,12 @@ The `*index` value is used as the offset for `_write_data` / `_read_data`
 (masked to `& (PW_RING_BYTES - 1)`) and as the base for `_write_update` /
 `_read_update`.
 
-**`param_changed` callbacks** — both streams respond to `SPA_PARAM_Format` by
-calling `pw_stream_update_params` with `SPA_PARAM_Buffers`. This moves the
-stream from `PAUSED` to `STREAMING`, causing the `process` callback to start
+**`param_changed` callbacks** — `pw_cap_param_changed` parses the negotiated
+`spa_audio_info_raw` (rate, channels), updates `stride`, `a->rate`,
+`a->channels`, calls `pw_stream_update_params` with `SPA_PARAM_Buffers`, and on
+its first invocation connects the playback stream with the negotiated rate.
+`pw_play_param_changed` only calls `pw_stream_update_params`. Both updates move
+the stream from `PAUSED` to `STREAMING`, causing the `process` callback to start
 firing.
 
 **`audio_fn` parking loop** — after setup the thread sits in a 10 ms
@@ -201,7 +208,8 @@ repeatedly), then spawns the thread. **`audio_stop`** is idempotent and safe
 to call when no thread is running.
 
 **Thread safety** — `a->rate`, `a->channels`, and `a->errmsg` are written once
-by the thread during startup, then only read by the UI thread for display
+by the audio thread (in `pw_cap_param_changed` for the PipeWire backend; during
+startup for the ALSA backend), then only read by the UI thread for display
 (benign race on int-sized fields). `rec_fn` and `rec_ctx` are protected by
 `rec_lock` (a `pthread_mutex_t` initialized in `audio_start`).
 
@@ -398,7 +406,7 @@ Row 4          mode info line:
                  M_SCANNING           — scan progress bar
                  M_SEEKING            — "Seeking forward >" / "Seeking backward <"
                  M_RECORD_NAME        — "Record file: ___"
-                 M_RECORDING          — "● REC 0:00  filename" (red, elapsed time)
+                 M_RECORDING          — "- REC 0:00  filename" (red, elapsed time)
 Row 5          horizontal separator
 Rows 6…LINES-4 list area:
                  M_NORMAL/M_TUNING/M_EDITING/M_SEEKING — preset grid

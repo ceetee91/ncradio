@@ -74,23 +74,23 @@ sudo make install
 The version output shows the audio backend and optional component versions:
 
 ```
-ncradio 0.1
-Built:  May 30 2026 18:34:51
+ncradio 0.1 built  May 30 2026 18:34:51
+by Constantinos Tsakiris
 
   Audio backend:         PipeWire 1.6.6
-  Device autodetect:     udev + sysfs — libudev 259
-  MP3 recording (lame):  yes — lame 3.100
+  Device autodetect:     libudev 259 + sysfs
+  MP3 recording:         lame 3.100
 ```
 
 or, when built against ALSA:
 
 ```
-ncradio 0.1
-Built:  May 30 2026 18:34:51
+ncradio 0.1 built  May 30 2026 18:34:51
+by Constantinos Tsakiris
 
-  Audio backend:         ALSA — libasound 1.2.15.3
-  Device autodetect:     udev + sysfs — libudev 259
-  MP3 recording (lame):  yes — lame 3.100
+  Audio backend:         ALSA (libasound 1.2.15.3)
+  Device autodetect:     libudev 259 + sysfs
+  MP3 recording:         lame 3.100
 ```
 
 The tuner device must be readable and writable by the current user. On most
@@ -260,14 +260,16 @@ When built with PipeWire, the audio pipe uses two PipeWire streams on a shared
 thread loop:
 
 - A **capture stream** (`PW_DIRECTION_INPUT`) that connects to the radio card's
-  PipeWire source node and receives audio at S16\_LE stereo 48 kHz. PipeWire
-  resamples from the hardware rate as needed.
+  PipeWire source node. It proposes S16\_LE with an open rate range so PipeWire
+  selects the source's native sample rate, avoiding a resample on the capture
+  side.
 - A **playback stream** (`PW_DIRECTION_OUTPUT`) that connects to the selected
-  sink (or PipeWire's default sink) and delivers the captured audio.
+  sink (or PipeWire's default sink). It is connected after the capture format is
+  negotiated, using the same rate, so at most one resample occurs (source native
+  → sink native) rather than two.
 
 Audio flows capture → lock-free ring buffer → playback, with PipeWire handling
-format negotiation, resampling, and hardware scheduling for each side
-independently.
+format negotiation and hardware scheduling on each side.
 
 ### ALSA backend (fallback)
 
@@ -342,7 +344,7 @@ an MP3 file on disk while continuing to play it back.
 During recording the info row shows:
 
 ```
-● REC 0:03  myshow.mp3
+- REC 0:03  myshow.mp3
 ```
 
 with a running elapsed time. All tuning, scanning, seeking, mute, and settings
@@ -484,9 +486,12 @@ When built with PipeWire, audio uses two `pw_stream` objects on a single
 | Capture | `PW_DIRECTION_INPUT` | Radio card's `Audio/Source` node |
 | Playback | `PW_DIRECTION_OUTPUT` | Speaker / configured `Audio/Sink` node |
 
-Format is fixed at S16\_LE stereo 48 kHz; PipeWire's built-in resampler adapts
-to the hardware rate on each side. Data flows via a 2 MiB lock-free ring buffer
-(`spa_ringbuffer`) between the capture and playback process callbacks.
+The capture stream proposes S16\_LE with an open rate range; PipeWire selects
+the source's native sample rate (no resample on the capture side). The playback
+stream is connected with the same rate after capture format is negotiated, so at
+most one resample occurs (source native → sink native). Data flows via a 2 MiB
+lock-free ring buffer (`spa_ringbuffer`) between the capture and playback
+process callbacks.
 
 ### ALSA audio (fallback)
 

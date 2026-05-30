@@ -40,7 +40,8 @@ struct pw_full_audio {
     struct spa_hook        play_listener;
     struct spa_ringbuffer  ring;
     uint8_t               *ring_buf;
-    uint32_t               stride;     /* bytes per frame, set before loop starts */
+    uint32_t               stride;          /* bytes per frame, updated on format negotiation */
+    int                    play_connected;  /* 1 once play stream is connected */
     char                   errmsg[128];
     Audio                 *audio;
 };
@@ -52,6 +53,19 @@ static void pw_cap_param_changed(void *data, uint32_t id,
 {
     struct pw_full_audio *s = data;
     if (!param || id != SPA_PARAM_Format) return;
+
+    struct spa_audio_info_raw info = {0};
+    if (spa_format_audio_raw_parse(param, &info) < 0) return;
+
+    uint32_t rate     = info.rate     > 0 ? info.rate     : 48000;
+    uint32_t channels = info.channels > 0 ? info.channels : 2;
+    if (channels > 2) channels = 2;
+
+    s->stride          = channels * 2;
+    s->audio->rate     = rate;
+    s->audio->channels = (int)channels;
+
+    /* Update capture buffer params to match negotiated stride. */
     uint8_t buf[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
     const struct spa_pod *params[1];
@@ -59,6 +73,30 @@ static void pw_cap_param_changed(void *data, uint32_t id,
         SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
         SPA_PARAM_BUFFERS_size, SPA_POD_Int(4096 * (int)s->stride));
     pw_stream_update_params(s->cap, params, 1);
+
+    /* Connect playback with the source's negotiated rate to avoid a second
+       resample hop between our ring buffer and the sink. */
+    if (!s->play_connected && s->play) {
+        struct spa_audio_info_raw fmt = {
+            .format   = SPA_AUDIO_FORMAT_S16_LE,
+            .rate     = rate,
+            .channels = channels,
+        };
+        fmt.position[0] = SPA_AUDIO_CHANNEL_FL;
+        if (channels >= 2) fmt.position[1] = SPA_AUDIO_CHANNEL_FR;
+
+        uint8_t pod_buf[1024];
+        struct spa_pod_builder pb = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
+        const struct spa_pod *pparams[1] = {
+            spa_format_audio_raw_build(&pb, SPA_PARAM_EnumFormat, &fmt)
+        };
+        pw_stream_connect(s->play, PW_DIRECTION_OUTPUT, PW_ID_ANY,
+                          PW_STREAM_FLAG_AUTOCONNECT |
+                          PW_STREAM_FLAG_MAP_BUFFERS |
+                          PW_STREAM_FLAG_RT_PROCESS,
+                          pparams, 1);
+        s->play_connected = 1;
+    }
 }
 
 static void pw_cap_process(void *data)
@@ -163,11 +201,10 @@ static void *audio_fn(void *arg)
     memset(&s, 0, sizeof(s));
     s.audio = a;
 
-    /* Fixed format: S16_LE stereo 48 kHz. PipeWire resamples as needed. */
-    const uint32_t rate = 48000, channels = 2;
-    s.stride    = channels * 2;
-    a->rate     = rate;
-    a->channels = (int)channels;
+    /* Initial stride for S16_LE stereo; updated in pw_cap_param_changed once
+       the source's native rate and channel count are negotiated. */
+    s.stride    = 2 * 2;
+    a->channels = 2;
 
     s.ring_buf = malloc(PW_RING_BYTES);
     if (!s.ring_buf) {
@@ -201,16 +238,9 @@ static void *audio_fn(void *arg)
         goto fail_locked;
     }
 
-    /* Audio format shared by both streams */
-    struct spa_audio_info_raw fmt = {
-        .format   = SPA_AUDIO_FORMAT_S16_LE,
-        .rate     = rate,
-        .channels = channels,
-    };
-    fmt.position[0] = SPA_AUDIO_CHANNEL_FL;
-    fmt.position[1] = SPA_AUDIO_CHANNEL_FR;
-
-    /* Capture stream (radio source → us) */
+    /* Capture stream (radio source → us).
+       Offer S16_LE with a rate range so PipeWire picks the source's native
+       sample rate, avoiding a resample on the capture side. */
     {
         struct pw_properties *props = pw_properties_new(
             PW_KEY_MEDIA_TYPE,     "Audio",
@@ -230,9 +260,14 @@ static void *audio_fn(void *arg)
 
         uint8_t pod_buf[1024];
         struct spa_pod_builder b = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
-        const struct spa_pod *params[1] = {
-            spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &fmt)
-        };
+        const struct spa_pod *params[1];
+        params[0] = spa_pod_builder_add_object(&b,
+            SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+            SPA_FORMAT_mediaType,      SPA_POD_Id(SPA_MEDIA_TYPE_audio),
+            SPA_FORMAT_mediaSubtype,   SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+            SPA_FORMAT_AUDIO_format,   SPA_POD_Id(SPA_AUDIO_FORMAT_S16_LE),
+            SPA_FORMAT_AUDIO_rate,     SPA_POD_CHOICE_RANGE_Int(48000, 8000, 384000),
+            SPA_FORMAT_AUDIO_channels, SPA_POD_CHOICE_RANGE_Int(2, 1, 2));
         pw_stream_connect(s.cap, PW_DIRECTION_INPUT, PW_ID_ANY,
                           PW_STREAM_FLAG_AUTOCONNECT |
                           PW_STREAM_FLAG_MAP_BUFFERS |
@@ -240,7 +275,9 @@ static void *audio_fn(void *arg)
                           params, 1);
     }
 
-    /* Playback stream (us → speaker sink) */
+    /* Playback stream (us → speaker sink).
+       Created here; connected from pw_cap_param_changed once the capture
+       format is negotiated so both streams use the same sample rate. */
     {
         struct pw_properties *props = pw_properties_new(
             PW_KEY_MEDIA_TYPE,     "Audio",
@@ -258,17 +295,7 @@ static void *audio_fn(void *arg)
             goto fail_locked;
         }
         pw_stream_add_listener(s.play, &s.play_listener, &pw_play_events, &s);
-
-        uint8_t pod_buf[1024];
-        struct spa_pod_builder b = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
-        const struct spa_pod *params[1] = {
-            spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &fmt)
-        };
-        pw_stream_connect(s.play, PW_DIRECTION_OUTPUT, PW_ID_ANY,
-                          PW_STREAM_FLAG_AUTOCONNECT |
-                          PW_STREAM_FLAG_MAP_BUFFERS |
-                          PW_STREAM_FLAG_RT_PROCESS,
-                          params, 1);
+        /* pw_stream_connect is deferred to pw_cap_param_changed */
     }
 
     pw_thread_loop_unlock(s.loop);
