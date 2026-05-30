@@ -27,6 +27,9 @@ typedef struct {
     /* volume (0-100; 0 = not yet saved, use default) */
     int      volume;
 
+    /* last tuned frequency in Hz (0 = not yet saved) */
+    uint32_t last_freq_hz;
+
     /* audio settings */
     int      audio_enabled;
     char     audio_device[64]; /* ALSA capture device, e.g. "hw:2,0" */

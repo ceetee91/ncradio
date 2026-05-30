@@ -967,6 +967,9 @@ int main(int argc, char *argv[])
     config_load(&config);
     if (config.volume > 0)
         radio_set_volume(&radio, config.volume);
+    if (config.last_freq_hz >= radio.freq_min_hz &&
+        config.last_freq_hz <= radio.freq_max_hz)
+        radio_set_freq(&radio, config.last_freq_hz);
 
 #ifdef HAVE_AUDIO
     /* Enumerate ALSA capture devices for the settings panel */
@@ -1057,6 +1060,7 @@ int main(int argc, char *argv[])
     if (mode == M_SCANNING) finish_scan();
 
     config.volume = radio.volume;
+    config.last_freq_hz = radio.freq_hz;
     config_save(&config);
 
     endwin();
