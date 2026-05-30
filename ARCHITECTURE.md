@@ -9,11 +9,12 @@ ncradio/
 ├── radio.h     — Radio struct and public function declarations
 ├── rds.c       — RDS block decoder (PS name, Radio Text)
 ├── rds.h       — RdsDecoder struct and rds_feed() declaration
-├── audio.c     — ALSA audio pipe (capture → playback thread)
+├── audio.c     — ALSA audio pipe (capture → playback thread) + device autodetect
 ├── audio.h     — Audio struct and public function declarations
 ├── config.c    — ~/.ncradio.conf read/write
 ├── config.h    — Config struct and function declarations
-└── Makefile
+├── Makefile
+└── configure   — build-time feature detection (libasound, libudev)
 ```
 
 ## Module responsibilities
@@ -52,14 +53,14 @@ rt_ab           — current RT A/B flag; toggle signals a new RT message
 
 ### `audio.c` / `audio.h`
 
-An ALSA-based audio pipe that runs in a background thread. It is entirely
-independent of the V4L2 radio module; the two interact only through
-`config.audio_device` and `config.audio_enabled`.
+An ALSA-based audio pipe that runs in a background thread, plus device
+autodetection logic. It is entirely independent of the V4L2 radio module; the
+two interact only through `config.audio_device` and `config.audio_enabled`.
 
 **`Audio` struct:**
 
 ```
-device[]    — ALSA capture device name (e.g. "hw:2,0")
+device[]    — ALSA capture device name (e.g. "hw:CARD=Si4713,DEV=0")
 running     — volatile; cleared by thread on exit or by caller to stop
 started     — 1 if pthread_create was called (thread needs joining)
 thread      — pthread handle
@@ -87,21 +88,14 @@ errmsg[]    — last error string; empty while running normally
 
 ```
 while a->running:
-    snd_pcm_wait(cap, 100ms)   — yields CPU; allows stop-flag check on timeout
-    snd_pcm_readi(cap, buf, period)
+    snd_pcm_readi(cap, buf, period)   — blocks ~100 ms per period
     snd_pcm_writei(play, buf, n)
     snd_pcm_recover on xrun in either direction
 ```
 
-The 100 ms `snd_pcm_wait` timeout means `audio_stop()` (which sets
-`a->running = 0` then `pthread_join`) returns within ~100 ms of being called,
-regardless of the hardware period size.
-
-**`audio_enum_devices`** calls `snd_device_name_hint(-1, "pcm", ...)` and
-filters to entries where `IOID` is `"Input"` (or absent, meaning both
-directions) **and** the device name starts with `"hw:"`. This excludes virtual
-ALSA plugins (`default`, `dmix`, `null`, `plug*`, etc.) and gives only
-physical capture endpoints.
+**`audio_enum_devices`** iterates ALSA cards via `snd_card_next` / `snd_ctl_pcm_next_device`
+and emits only physical capture endpoints (`hw:CARD=<id>,DEV=N`), excluding
+virtual plugins (`default`, `dmix`, `null`, etc.).
 
 **`audio_start`** calls `audio_stop` first (making it safe to call repeatedly),
 then spawns the thread. **`audio_stop`** is idempotent and safe to call when no
@@ -111,6 +105,24 @@ thread is running.
 during startup, then only read by the UI thread for display. The benign data
 race on these `int`-sized fields is acceptable; they are informational only.
 `a->errmsg` follows the same pattern.
+
+**`audio_autodetect(radio_dev, out, out_size)`** finds the ALSA capture device
+associated with a V4L2 radio device by correlating their kernel sysfs paths.
+Two strategies are tried in order:
+
+1. **udev** (`detect_udev`, compiled only with `HAVE_UDEV`): opens the radio
+   character device via `stat` + `udev_device_new_from_devnum`, walks up to
+   the USB device node, then enumerates all `sound` subsystem devices and
+   matches those sharing the same USB ancestor. Returns
+   `hw:CARD=<id>,DEV=0`.
+
+2. **sysfs** (`detect_sysfs`): resolves
+   `/sys/class/video4linux/<radioN>` to its real path using `chdir` +
+   `getcwd` (avoids the `realpath` POSIX version dependency), strips the
+   `video4linux/<name>` tail, then walks up to three parent directories
+   looking for a `sound/card*` entry in each level and its direct children.
+   Reads the card `id` sysattr to produce `hw:CARD=<id>,DEV=0`, falling
+   back to `hw:N,0` if the id file is absent.
 
 ### `config.c` / `config.h`
 
@@ -123,8 +135,12 @@ int      count                               — number of presets
 uint32_t scan_step_hz                        — scan/step/seek increment (Hz)
 int      signal_threshold_pct                — minimum signal strength (0-100%)
 int      rds_names                           — 1 = collect RDS names during scan
+int      volume                              — tuner volume 0-100 (0 = not yet saved)
+uint32_t last_freq_hz                        — last tuned frequency in Hz (0 = not yet saved)
 int      audio_enabled                       — 1 = start audio pipe at launch
-char     audio_device[64]                    — ALSA capture device (e.g. "hw:2,0")
+char     audio_device[64]                    — ALSA capture device (e.g. "hw:CARD=foo,DEV=0")
+int      audio_mute_scan                     — 1 = stop audio pipe during band scan
+int      audio_mute_seek                     — 1 = stop audio pipe while seeking
 ```
 
 **File format:**
@@ -134,8 +150,12 @@ char     audio_device[64]                    — ALSA capture device (e.g. "hw:2
 scan_step=100000         ← integer key=value
 signal_threshold=30
 rds_names=1
+volume=80
+last_freq=98500000
 audio_enabled=1
-audio_device=hw:2,0      ← string key=value
+audio_device=hw:CARD=Si4713,DEV=0   ← string key=value
+audio_mute_scan=1
+audio_mute_seek=1
 # stations
 87.90 BBC Radio 1        ← float [optional name]
 98.50
@@ -166,6 +186,8 @@ fd              — open file descriptor for /dev/radioN
 cap_low         — 1 if V4L2 freq unit is 62.5 Hz, else 62.5 kHz
 rds_capable     — hardware advertises V4L2_TUNER_CAP_RDS
 stereo          — updated from rxsubchans on every radio_get_signal() call
+freq_min_hz     — device-reported lower bound of tunable range
+freq_max_hz     — device-reported upper bound of tunable range
 freq_hz         — current tuned frequency in Hz (unchanged while scan/seek runs)
 rds             — RdsDecoder for the live (non-scan) stream
 
@@ -187,7 +209,10 @@ mutex           — protects found_freqs, found_names, found_count, scan_pos_hz
 
 **V4L2 frequency units** — `VIDIOC_G_TUNER` reveals whether the tuner uses
 62.5 Hz units (`V4L2_TUNER_CAP_LOW`) or 62.5 kHz units. The static helpers
-`hz_to_v4l2` / `v4l2_to_hz` convert transparently.
+`hz_to_v4l2` / `v4l2_to_hz` convert transparently. `VIDIOC_G_TUNER` also
+reports the device's tunable range (`tuner.rangelow` / `tuner.rangehigh`),
+which is stored in `freq_min_hz` / `freq_max_hz` and used to validate manual
+tune input and to clamp the restored `last_freq` on startup.
 
 **Stereo detection** — `radio_get_signal()` calls `VIDIOC_G_TUNER` and extracts
 both `tuner.signal` (→ 0-100%) and `tuner.rxsubchans & V4L2_TUNER_SUB_STEREO`
@@ -259,23 +284,47 @@ LINES-1        second help line (M_NORMAL only)
 - `[A!]` red — pipe stopped with an error (error text visible in settings panel)
 - absent — audio disabled in config
 
-**Settings panel** (`draw_settings()`) — five rows in the list area:
+**Settings panel** (`draw_settings()`) — seven rows in the list area when audio
+is compiled in:
 
 ```
-Row +2   Scan step:          0.10 MHz    <- -> to cycle
-Row +3   Signal threshold:   30%         <- -> to adjust (5% steps)
-Row +4   Save RDS names:     Yes         <- -> or Enter to toggle
-Row +5   Audio output:       On (48000Hz 2ch)  <- -> or Enter to toggle
-Row +6   Audio device:       hw:2,0      <- -> to cycle  <description>
+Row +2   Scan step:            0.10 MHz    <- -> to cycle
+Row +3   Signal threshold:     30%         <- -> to adjust (5% steps)
+Row +4   Save RDS names:       Yes         <- -> or Enter to toggle
+Row +5   Audio output:         On (48000Hz 2ch)  <- -> or Enter to toggle
+Row +6   Audio device:         hw:CARD=foo,DEV=0  <- -> to cycle  <description>
+Row +7   Mute while scanning:  Yes         <- -> or Enter to toggle
+Row +8   Mute while seeking:   Yes         <- -> or Enter to toggle
 ```
 
-Changing **Audio output** calls `audio_apply()` which starts or stops the
-`Audio` thread immediately. Changing **Audio device** while audio is on calls
-`audio_start()` directly (which calls `audio_stop()` first), so the pipe
-restarts on the new device without any manual toggle.
+**`audio_apply()`** — called on startup and whenever audio settings change:
 
-`audio_apply()` also handles the first-run case: if audio is enabled but no
-device is configured, it auto-selects `audio_dev_names[0]` and saves it.
+1. If `audio_enabled` is off → `audio_stop` and return.
+2. If `audio_device` is empty → call `audio_autodetect(radio_dev_path, …)`.
+   On success, save the detected device to config. On failure, return without
+   starting (audio stays off).
+3. Call `audio_start(audio_device)`.
+
+**Startup sequence** (`main()`):
+
+1. `radio_open` — opens the V4L2 device, reads tunable range and capabilities.
+2. `config_load` — reads `~/.ncradio.conf`; applies defaults for missing keys.
+3. Restore volume: if `config.volume > 0`, call `radio_set_volume`.
+4. Restore frequency: if `config.last_freq_hz` is within the device's reported
+   range, call `radio_set_freq`.
+5. Enumerate ALSA capture devices for the settings panel.
+6. Auto-enable audio: if `audio_enabled == 0` and `audio_device` is empty
+   (i.e. no explicit prior choice), call `audio_autodetect`. If a device is
+   found, set `audio_enabled = 1`, save both fields, and proceed.
+7. `audio_apply` — start the pipe if enabled.
+
+**Exit sequence** (`main()` after the event loop):
+
+1. If still in scan mode, `finish_scan`.
+2. `radio_mute(1)` — silence the tuner before teardown.
+3. Save `config.volume = radio.volume` and `config.last_freq_hz = radio.freq_hz`.
+4. `config_save`.
+5. `endwin`, `audio_stop`, `radio_close`.
 
 **Preset grid layout** (`preset_layout()` in `draw_presets()`):
 
@@ -323,10 +372,10 @@ race).
     │
     ├─ audio_apply / audio_start / audio_stop  ← settings o key
     │       └─ pthread_create → audio_fn
-    │                   ├─ snd_pcm_open(hw:X,Y, CAPTURE)
+    │                   ├─ snd_pcm_open(hw:CARD=x,DEV=0, CAPTURE)
     │                   ├─ probe rate, configure S16_LE
     │                   ├─ snd_pcm_open("default", PLAYBACK)
-    │                   └─ snd_pcm_wait → snd_pcm_readi → snd_pcm_writei loop
+    │                   └─ snd_pcm_readi → snd_pcm_writei loop
     │
     ├─ config_add / config_del / config_save   → ~/.ncradio.conf
     │
@@ -343,5 +392,15 @@ race).
 
 ## Build
 
-A single `Makefile` with explicit per-object dependencies. Compiled with
-`-Wall -Wextra -O2`. Linked against `-lncurses -lpthread -lasound`.
+`configure` probes for `libasound` (required for audio) and `libudev`
+(optional; used for ALSA autodetection). It writes `config.mk` with
+`AUDIO_CFLAGS`, `AUDIO_SRCS`, and `AUDIO_LIBS`. The Makefile `-include`s
+`config.mk` and otherwise needs no changes to accommodate new optional
+dependencies.
+
+The `--disable-udev` flag sets `UDEV=no` before the libudev probe runs,
+producing a build that links only `-lasound` and uses the sysfs detection
+path.
+
+Compiled with `-Wall -Wextra -O2 -D_POSIX_C_SOURCE=199309L`. Linked against
+`-lncurses -lpthread -lasound` (plus `-ludev` when udev is enabled).

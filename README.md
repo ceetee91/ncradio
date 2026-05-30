@@ -26,17 +26,29 @@ device.
 **Runtime:**
 - Linux kernel with V4L2 radio support (`/dev/radio0`)
 - ALSA (`libasound`) for audio output
+- `libudev` for automatic ALSA device detection (optional; falls back to sysfs)
 
 **Build:**
 - `ncurses` development headers (`ncurses-devel` / `libncurses-dev`)
 - `alsa-lib` development headers (`alsa-lib-devel` / `libasound2-dev`)
+- `libudev` development headers (`systemd-devel` / `libudev-dev`) — optional
 - GCC and GNU make
 
 ## Build
 
 ```sh
+./configure
 make
 ```
+
+`configure` detects `libasound` and `libudev` automatically and writes
+`config.mk`. Run `./configure --help` for all options:
+
+| Option | Effect |
+|--------|--------|
+| `--disable-audio` | Build without ALSA audio support |
+| `--enable-audio` | Require ALSA audio (fail if not found) |
+| `--disable-udev` | Use sysfs-only ALSA autodetection; do not link libudev |
 
 Optional install to `/usr/local/bin`:
 
@@ -57,6 +69,10 @@ distributions, add yourself to the `video` group:
 ```sh
 sudo usermod -aG video $USER
 ```
+
+On startup ncradio restores the last tuned frequency and volume from
+`~/.ncradio.conf`. On exit the tuner is muted, then the current frequency
+and volume are persisted.
 
 ## Key Bindings
 
@@ -121,7 +137,7 @@ sudo usermod -aG video $USER
 |-----|--------|
 | `↑` / `↓` | Select setting |
 | `←` / `→` | Adjust value |
-| `Enter` | Toggle boolean settings (RDS names, Audio output) |
+| `Enter` | Toggle boolean settings |
 | `Esc` or `o` | Close settings |
 
 ## Status display
@@ -189,17 +205,31 @@ device (PulseAudio, PipeWire, or ALSA "default"). This is functionally
 equivalent to running:
 
 ```sh
-arecord -D hw:2,0 -r 96000 -f S16_LE -c 2 | aplay -
+arecord -D hw:CARD=foo,DEV=0 -r 96000 -f S16_LE -c 2 | aplay -
 ```
 
 but handled entirely in-process via the ALSA library.
 
-### Enabling audio
+### Autodetection
+
+On first launch, ncradio attempts to find the ALSA capture device that belongs
+to the same hardware as the V4L2 radio device. It tries two methods in order:
+
+1. **udev** — walks up to the USB device node and matches sound cards sharing
+   the same USB parent. Requires `libudev` at build time; disabled with
+   `./configure --disable-udev`.
+2. **sysfs** — resolves the radio device's sysfs path and searches sibling
+   directories for a `sound/card*` entry. Always available.
+
+If a device is found it is saved to `~/.ncradio.conf` and audio is enabled
+automatically. Subsequent launches use the saved device. If no device is found
+audio stays off; it can be enabled manually in the settings panel.
+
+### Enabling audio manually
 
 1. Press `o` to open settings.
 2. Navigate to **Audio output** and press `Enter` or `←`/`→` to switch to **On**.
-3. If no device is configured yet, ncradio auto-selects the first detected
-   capture device.
+3. If no device is configured yet, ncradio runs autodetection as described above.
 4. Navigate to **Audio device** and use `←`/`→` to cycle through all detected
    ALSA capture devices. The device description (card and PCM name) is shown
    as a hint on that row.
@@ -258,6 +288,8 @@ written to `~/.ncradio.conf` on every adjustment.
 | Save RDS names | Yes | Yes / No | Whether to pause on each found station to collect its RDS PS name during scan |
 | Audio output | Off | Off / On | Enable or disable the audio pipe |
 | Audio device | (auto) | any detected `hw:X,Y` | ALSA capture device to read audio from |
+| Mute while scanning | Yes | Yes / No | Stop the audio pipe during a band scan |
+| Mute while seeking | Yes | Yes / No | Stop the audio pipe while seeking |
 
 ## Configuration file
 
@@ -268,8 +300,12 @@ Settings and presets are stored together in `~/.ncradio.conf`:
 scan_step=100000
 signal_threshold=30
 rds_names=1
-audio_enabled=0
-audio_device=hw:2,0
+volume=80
+last_freq=98500000
+audio_enabled=1
+audio_device=hw:CARD=Si4713,DEV=0
+audio_mute_scan=1
+audio_mute_seek=1
 # stations
 87.90 BBC Radio 1
 91.30
@@ -284,8 +320,12 @@ audio_device=hw:2,0
 | `scan_step` | Hz (e.g. `100000`) | Frequency step for scan, step, and seek |
 | `signal_threshold` | percentage (e.g. `30`) | Minimum signal to record a station |
 | `rds_names` | `0` or `1` | Whether to collect RDS names during scan |
+| `volume` | `0`–`100` | Tuner volume restored on startup |
+| `last_freq` | Hz (e.g. `98500000`) | Last tuned frequency, restored on startup |
 | `audio_enabled` | `0` or `1` | Whether to start the audio pipe at launch |
-| `audio_device` | ALSA device (e.g. `hw:2,0`) | Capture device for the audio pipe |
+| `audio_device` | ALSA device (e.g. `hw:CARD=foo,DEV=0`) | Capture device for the audio pipe |
+| `audio_mute_scan` | `0` or `1` | Whether to stop audio during a band scan |
+| `audio_mute_seek` | `0` or `1` | Whether to stop audio while seeking |
 
 **Station lines** — frequency in MHz, optional name after a space. Lines
 starting with `#` are comments.
@@ -307,7 +347,7 @@ versions reading a new config silently ignore the `key=value` lines (the
 
 | ioctl | Purpose |
 |-------|---------|
-| `VIDIOC_G_TUNER` | Detect frequency unit, RDS capability, signal strength, stereo status |
+| `VIDIOC_G_TUNER` | Detect frequency unit, RDS capability, tunable range, signal strength, stereo status |
 | `VIDIOC_G_FREQUENCY` / `VIDIOC_S_FREQUENCY` | Get / set tuner frequency |
 | `VIDIOC_S_HW_FREQ_SEEK` | Hardware-assisted station seek (available in `radio.c`, not currently bound to a key) |
 | `VIDIOC_S_CTRL` | Volume (`V4L2_CID_AUDIO_VOLUME`), mute (`V4L2_CID_AUDIO_MUTE`), RDS reception (`V4L2_CID_RDS_RECEPTION`) |
@@ -315,16 +355,18 @@ versions reading a new config silently ignore the `key=value` lines (the
 RDS data is obtained by calling `read()` on the radio device file descriptor,
 which returns a stream of `struct v4l2_rds_data` blocks (3 bytes each).
 
+The tunable frequency range is read from `VIDIOC_G_TUNER` at startup and used
+to validate manual tune input and to clamp the restored `last_freq` value.
+
 ### ALSA audio
 
 The audio pipe uses the following ALSA API calls:
 
 | Call | Purpose |
 |------|---------|
-| `snd_device_name_hint` | Enumerate PCM devices for the settings panel |
+| `snd_ctl_open` / `snd_ctl_pcm_next_device` | Enumerate physical PCM capture devices for the settings panel |
 | `snd_pcm_open` | Open capture (`hw:X,Y`) and playback (`default`) PCMs |
 | `snd_pcm_hw_params_test_rate` | Probe supported sample rates without modifying device state |
 | `snd_pcm_hw_params_*` | Configure format (S16\_LE), channels, rate, period size |
-| `snd_pcm_wait` | Wait for capture data with a 100 ms timeout (allows stop-flag check) |
 | `snd_pcm_readi` / `snd_pcm_writei` | Interleaved read/write of sample frames |
 | `snd_pcm_recover` | Recover from buffer overruns and underruns |
