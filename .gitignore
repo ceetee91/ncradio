@@ -1,2 +1,3 @@
 ncradio
 *.o
+config.mk
