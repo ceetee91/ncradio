@@ -2,11 +2,13 @@
 #include <pthread.h>
 
 #define AUDIO_DEV_MAX      32
-#define AUDIO_DEV_NAMELEN  64   /* "hw:X,Y" */
-#define AUDIO_DEV_DESCLEN  128  /* human-readable card/device name */
+#define AUDIO_DEV_NAMELEN  64   /* device/node name */
+#define AUDIO_DEV_DESCLEN  128  /* human-readable description */
 
 typedef struct {
-    char         device[AUDIO_DEV_NAMELEN]; /* ALSA capture device */
+    char         device[AUDIO_DEV_NAMELEN];      /* capture device / PipeWire source node */
+    char         play_device[AUDIO_DEV_NAMELEN]; /* playback device / PipeWire sink node; empty = default */
+    unsigned int buffer_frames;  /* period size hint; 0 → use default */
     volatile int running;    /* 1 while thread is alive */
     int          started;    /* pthread_create was called, needs join */
     pthread_t    thread;
@@ -22,24 +24,37 @@ typedef struct {
     void  *rec_ctx;
 } Audio;
 
-/* Start audio pipe: capture from device → playback on "default".
+/* Start audio pipe: capture from device → playback on play_device (or default).
    Stops any currently running pipe first. Returns 0 on success. */
 int  audio_start(Audio *a, const char *device);
 
 /* Stop audio pipe; safe to call when not running. */
 void audio_stop(Audio *a);
 
-/* Enumerate physical ALSA capture devices (hw:X,Y only).
-   Fills parallel names[]/descs[] arrays; sets *count. */
+/* Enumerate capture devices.
+   PipeWire build: enumerates Audio/Source nodes.
+   ALSA build:     enumerates hw:X,Y capture devices. */
 void audio_enum_devices(char names[][AUDIO_DEV_NAMELEN],
                         char descs[][AUDIO_DEV_DESCLEN],
                         int *count, int max);
 
+/* Enumerate playback devices. Index 0 is always "" / "(default)".
+   PipeWire build: subsequent entries are Audio/Sink nodes.
+   ALSA build:     subsequent entries are hw:CARD=X,DEV=Y devices. */
+void audio_enum_play_devices(char names[][AUDIO_DEV_NAMELEN],
+                             char descs[][AUDIO_DEV_DESCLEN],
+                             int *count, int max);
+
+#ifdef HAVE_PIPEWIRE
+/* Runtime PipeWire library version string (e.g. "1.0.5"). */
+const char *audio_pipewire_version(void);
+#else
 /* Runtime ALSA library version string (e.g. "1.2.10"). */
 const char *audio_alsa_version(void);
+#endif
 
-/* Detect the ALSA capture device associated with a V4L2 radio device.
+/* Detect the audio capture device associated with a V4L2 radio device.
    radio_dev: path like "/dev/radio0"
-   out: receives "hw:CARD=<id>,DEV=0" style string on success
+   out: receives the device/node name on success
    Returns 1 if a device was found, 0 otherwise. */
 int audio_autodetect(const char *radio_dev, char *out, int out_size);

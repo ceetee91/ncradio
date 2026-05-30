@@ -25,13 +25,14 @@ device.
 
 **Runtime:**
 - Linux kernel with V4L2 radio support (`/dev/radio0`)
-- ALSA (`libasound`) for audio output
-- `libudev` for automatic ALSA device detection (optional; falls back to sysfs)
+- PipeWire (preferred) **or** ALSA (`libasound`) for audio output
+- `libudev` for automatic audio device detection (optional; falls back to sysfs)
 - `libmp3lame` for MP3 recording (optional)
 
 **Build:**
 - `ncurses` development headers (`ncurses-devel` / `libncurses-dev`)
-- `alsa-lib` development headers (`alsa-lib-devel` / `libasound2-dev`)
+- `libpipewire-0.3` development headers (`pipewire-devel` / `libpipewire-0.3-dev`) — preferred
+- `alsa-lib` development headers (`alsa-lib-devel` / `libasound2-dev`) — fallback if PipeWire not found
 - `libudev` development headers (`systemd-devel` / `libudev-dev`) — optional
 - `lame` development headers (`lame-devel` / `libmp3lame-dev`) — optional
 - GCC and GNU make
@@ -43,14 +44,16 @@ device.
 make
 ```
 
-`configure` detects `libasound` and `libudev` automatically and writes
-`config.mk`. Run `./configure --help` for all options:
+`configure` detects audio backends automatically: PipeWire is used when
+available; ALSA (`libasound`) is the fallback. It writes `config.mk`. Run
+`./configure --help` for all options:
 
 | Option | Effect |
 |--------|--------|
-| `--disable-audio` | Build without ALSA audio support |
-| `--enable-audio` | Require ALSA audio (fail if not found) |
-| `--disable-udev` | Use sysfs-only ALSA autodetection; do not link libudev |
+| `--disable-audio` | Build without audio support |
+| `--enable-audio` | Require audio (fail if no backend found) |
+| `--disable-pipewire` | Prefer ALSA even if PipeWire is available |
+| `--disable-udev` | Use sysfs-only device autodetection; do not link libudev |
 | `--disable-lame` | Build without MP3 recording support |
 
 Optional install to `/usr/local/bin`:
@@ -68,15 +71,25 @@ sudo make install
 ./ncradio --version    # same
 ```
 
-The version output includes the build date/time and, for each optional
-component, whether it was compiled in and which library version was linked:
+The version output shows the audio backend and optional component versions:
 
 ```
 ncradio 0.1
-Built:  May 30 2026 11:45:19
+Built:  May 30 2026 18:34:51
 
-  Audio (ALSA):          yes — libasound 1.2.15.3
-  ALSA autodetect:       udev + sysfs — libudev 259
+  Audio backend:         PipeWire 1.6.6
+  Device autodetect:     udev + sysfs — libudev 259
+  MP3 recording (lame):  yes — lame 3.100
+```
+
+or, when built against ALSA:
+
+```
+ncradio 0.1
+Built:  May 30 2026 18:34:51
+
+  Audio backend:         ALSA — libasound 1.2.15.3
+  Device autodetect:     udev + sysfs — libudev 259
   MP3 recording (lame):  yes — lame 3.100
 ```
 
@@ -238,26 +251,54 @@ pre-seek frequency and a "No station found" message is shown.
 
 ## Audio output
 
-ncradio can pipe the tuner's audio directly to the system's default playback
-device (PulseAudio, PipeWire, or ALSA "default"). This is functionally
-equivalent to running:
+ncradio pipes the tuner's audio directly to the system's playback device. The
+audio backend is selected at build time by `configure`.
 
-```sh
-arecord -D hw:CARD=foo,DEV=0 -r 96000 -f S16_LE -c 2 | aplay -
-```
+### PipeWire backend (default)
 
-but handled entirely in-process via the ALSA library.
+When built with PipeWire, the audio pipe uses two PipeWire streams on a shared
+thread loop:
+
+- A **capture stream** (`PW_DIRECTION_INPUT`) that connects to the radio card's
+  PipeWire source node and receives audio at S16\_LE stereo 48 kHz. PipeWire
+  resamples from the hardware rate as needed.
+- A **playback stream** (`PW_DIRECTION_OUTPUT`) that connects to the selected
+  sink (or PipeWire's default sink) and delivers the captured audio.
+
+Audio flows capture → lock-free ring buffer → playback, with PipeWire handling
+format negotiation, resampling, and hardware scheduling for each side
+independently.
+
+### ALSA backend (fallback)
+
+When built without PipeWire, the audio pipe uses libasound directly:
+
+- Capture opens the configured `hw:X,Y` device, probes the highest supported
+  sample rate from `{96000, 48000, 44100, 32000, 22050, 16000}` Hz, and
+  configures S16\_LE stereo (falling back to mono).
+- Playback opens `"default"` (which routes to PulseAudio, PipeWire, or ALSA hw
+  as the system is configured) with the same format.
+
+The detected rate and channel count are shown in the **Audio output** row of
+the settings panel while the pipe is running (e.g. `On (48000Hz 2ch)`).
 
 ### Autodetection
 
-On first launch, ncradio attempts to find the ALSA capture device that belongs
-to the same hardware as the V4L2 radio device. It tries two methods in order:
+On first launch, ncradio attempts to find the audio capture device associated
+with the V4L2 radio device. Two strategies are tried in order:
 
 1. **udev** — walks up to the USB device node and matches sound cards sharing
    the same USB parent. Requires `libudev` at build time; disabled with
    `./configure --disable-udev`.
 2. **sysfs** — resolves the radio device's sysfs path and searches sibling
    directories for a `sound/card*` entry. Always available.
+
+With the **PipeWire** backend, the detected ALSA card name is then matched
+against enumerated PipeWire `Audio/Source` nodes (by `api.alsa.card.id`
+property) and the PipeWire node name is stored.
+
+With the **ALSA** backend, the ALSA `hw:CARD=<id>,DEV=0` string is stored
+directly.
 
 If a device is found it is saved to `~/.ncradio.conf` and audio is enabled
 automatically. Subsequent launches use the saved device. If no device is found
@@ -268,34 +309,22 @@ audio stays off; it can be enabled manually in the settings panel.
 1. Press `o` to open settings.
 2. Navigate to **Audio output** and press `Enter` or `←`/`→` to switch to **On**.
 3. If no device is configured yet, ncradio runs autodetection as described above.
-4. Navigate to **Audio device** and use `←`/`→` to cycle through all detected
-   ALSA capture devices. The device description (card and PCM name) is shown
-   as a hint on that row.
+4. Navigate to **Audio device** and use `←`/`→` to cycle through detected devices.
+
+With the PipeWire backend, the device list shows PipeWire `Audio/Source` node
+names and descriptions. With the ALSA backend, it shows `hw:CARD=X,DEV=Y`
+devices.
 
 Changes take effect immediately — switching the device or toggling audio
 restarts the pipe on the fly.
 
-### Rate and channel detection
+### Play device
 
-ncradio probes the capture device for the highest supported sample rate from
-the list `{96000, 48000, 44100, 32000, 22050, 16000}` Hz. It tries stereo
-first and falls back to mono if the device does not support two channels. The
-detected rate and channel count are displayed in the **Audio output** row of
-the settings panel while the pipe is running (e.g. `On (48000Hz 2ch)`).
+The **Play device** setting selects the output destination:
 
-The playback side opens `"default"` (PulseAudio/PipeWire/ALSA) and matches the
-same format, letting the system's audio stack handle any further resampling.
-
-### Audio device list
-
-Only physical `hw:X,Y` ALSA PCM capture devices appear in the device list —
-virtual plugins such as `default`, `dmix`, and `null` are excluded. To find
-your tuner's device name outside of ncradio:
-
-```sh
-arecord -l          # list capture devices
-cat /proc/asound/cards
-```
+- PipeWire build: a PipeWire `Audio/Sink` node name; empty = PipeWire
+  default sink.
+- ALSA build: an ALSA playback device name; empty = `"default"`.
 
 ## MP3 recording
 
@@ -330,10 +359,8 @@ The recording format is configurable from the settings panel:
 | Record channels | Stereo | Stereo / Mono |
 | Record sample rate | 44100 Hz | 22050 / 44100 / 48000 Hz |
 
-The encoder receives PCM at the hardware's capture rate and channels and
-resamples / downmixes as needed to produce the configured output format. If the
-capture device can only deliver mono, the output is forced to mono regardless of
-the channels setting.
+The encoder receives PCM at the pipe's capture rate and channels and resamples
+/ downmixes as needed to produce the configured output format.
 
 ## Preset list
 
@@ -363,7 +390,7 @@ written to `~/.ncradio.conf` on every adjustment.
 | Signal threshold | 30% | 5% – 95% (5% steps) | Minimum signal strength to record a station during scan/seek |
 | Save RDS names | Yes | Yes / No | Whether to pause on each found station to collect its RDS PS name during scan |
 | Audio output | Off | Off / On | Enable or disable the audio pipe |
-| Audio device | (auto) | any detected `hw:X,Y` | ALSA capture device to read audio from |
+| Audio device | (auto) | detected capture devices | Capture device / PipeWire source node |
 | Mute while scanning | Yes | Yes / No | Stop the audio pipe during a band scan |
 | Mute while seeking | Yes | Yes / No | Stop the audio pipe while seeking |
 | Record bitrate | 128 kbps | 64 / 96 / 128 / 192 / 256 / 320 kbps | MP3 bitrate for recordings (shown only when lame is compiled in) |
@@ -382,7 +409,7 @@ rds_names=1
 volume=80
 last_freq=98500000
 audio_enabled=1
-audio_device=hw:CARD=Si4713,DEV=0
+audio_device=alsa_input.hw:CARD=Si4713,DEV=0.0.analog-stereo
 audio_mute_scan=1
 audio_mute_seek=1
 record_bitrate=128
@@ -395,6 +422,9 @@ record_samplerate=44100
 103.60 LBC
 ```
 
+The `audio_device` value is a PipeWire source node name when built with
+PipeWire, or an ALSA `hw:CARD=<id>,DEV=0` string when built with ALSA.
+
 **Settings lines** — `key=value` pairs written before the station list:
 
 | Key | Value | Meaning |
@@ -405,7 +435,8 @@ record_samplerate=44100
 | `volume` | `0`–`100` | Tuner volume restored on startup |
 | `last_freq` | Hz (e.g. `98500000`) | Last tuned frequency, restored on startup |
 | `audio_enabled` | `0` or `1` | Whether to start the audio pipe at launch |
-| `audio_device` | ALSA device (e.g. `hw:CARD=foo,DEV=0`) | Capture device for the audio pipe |
+| `audio_device` | device name | Capture device / PipeWire source node for the audio pipe |
+| `audio_play_device` | device name | Playback device / PipeWire sink node; empty = default |
 | `audio_mute_scan` | `0` or `1` | Whether to stop audio during a band scan |
 | `audio_mute_seek` | `0` or `1` | Whether to stop audio while seeking |
 | `record_bitrate` | kbps (e.g. `128`) | MP3 encoding bitrate |
@@ -443,9 +474,23 @@ which returns a stream of `struct v4l2_rds_data` blocks (3 bytes each).
 The tunable frequency range is read from `VIDIOC_G_TUNER` at startup and used
 to validate manual tune input and to clamp the restored `last_freq` value.
 
-### ALSA audio
+### PipeWire audio
 
-The audio pipe uses the following ALSA API calls:
+When built with PipeWire, audio uses two `pw_stream` objects on a single
+`pw_thread_loop`:
+
+| Stream | Direction | Target |
+|--------|-----------|--------|
+| Capture | `PW_DIRECTION_INPUT` | Radio card's `Audio/Source` node |
+| Playback | `PW_DIRECTION_OUTPUT` | Speaker / configured `Audio/Sink` node |
+
+Format is fixed at S16\_LE stereo 48 kHz; PipeWire's built-in resampler adapts
+to the hardware rate on each side. Data flows via a 2 MiB lock-free ring buffer
+(`spa_ringbuffer`) between the capture and playback process callbacks.
+
+### ALSA audio (fallback)
+
+When built without PipeWire, the audio pipe uses these ALSA API calls:
 
 | Call | Purpose |
 |------|---------|

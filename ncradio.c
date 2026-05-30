@@ -72,15 +72,17 @@ static int settings_sel = 0;
 #ifdef HAVE_AUDIO
 #define SETTING_AUDIO_ENABLE    3
 #define SETTING_AUDIO_DEV       4
-#define SETTING_AUDIO_MUTE_SCAN 5
-#define SETTING_AUDIO_MUTE_SEEK 6
+#define SETTING_AUDIO_PLAY_DEV  5
+#define SETTING_AUDIO_BUFFER    6
+#define SETTING_AUDIO_MUTE_SCAN 7
+#define SETTING_AUDIO_MUTE_SEEK 8
 #ifdef HAVE_LAME
-#define SETTING_REC_BITRATE     7
-#define SETTING_REC_STEREO      8
-#define SETTING_REC_SAMPLERATE  9
-#define SETTING_COUNT           10
+#define SETTING_REC_BITRATE     9
+#define SETTING_REC_STEREO      10
+#define SETTING_REC_SAMPLERATE  11
+#define SETTING_COUNT           12
 #else
-#define SETTING_COUNT           7
+#define SETTING_COUNT           9
 #endif
 #else
 #define SETTING_COUNT           3
@@ -92,12 +94,22 @@ static Audio audio = { .rec_lock = PTHREAD_MUTEX_INITIALIZER };
 static char  audio_dev_names[AUDIO_DEV_MAX][AUDIO_DEV_NAMELEN];
 static char  audio_dev_descs[AUDIO_DEV_MAX][AUDIO_DEV_DESCLEN];
 static int   audio_dev_count = 0;
+static char  audio_play_dev_names[AUDIO_DEV_MAX][AUDIO_DEV_NAMELEN];
+static char  audio_play_dev_descs[AUDIO_DEV_MAX][AUDIO_DEV_DESCLEN];
+static int   audio_play_dev_count = 0;
 
 static int audio_dev_idx(void)
 {
     for (int i = 0; i < audio_dev_count; i++)
         if (strcmp(audio_dev_names[i], config.audio_device) == 0) return i;
     return -1;
+}
+
+static int audio_play_dev_idx(void)
+{
+    for (int i = 0; i < audio_play_dev_count; i++)
+        if (strcmp(audio_play_dev_names[i], config.audio_play_device) == 0) return i;
+    return 0;  /* fall back to "(default)" */
 }
 
 /* Start audio if enabled and a device is configured.  If no device is set,
@@ -113,8 +125,13 @@ static void audio_apply(void)
             config_save(&config);
         }
     }
-    if (config.audio_device[0])
+    if (config.audio_device[0]) {
+        strncpy(audio.play_device, config.audio_play_device,
+                sizeof(audio.play_device) - 1);
+        audio.play_device[sizeof(audio.play_device) - 1] = '\0';
+        audio.buffer_frames = (unsigned int)config.audio_buffer_frames;
         audio_start(&audio, config.audio_device);
+    }
 }
 #endif /* HAVE_AUDIO */
 
@@ -346,7 +363,9 @@ static void draw_settings(void)
         "Save RDS names:",
 #ifdef HAVE_AUDIO
         "Audio output:",
-        "Tuner device:",
+        "Capture device:",
+        "Playback device:",
+        "Buffer size:",
         "Mute while scanning:",
         "Mute while seeking:",
 #ifdef HAVE_LAME
@@ -362,6 +381,8 @@ static void draw_settings(void)
         "<- -> or Enter to toggle",
 #ifdef HAVE_AUDIO
         "<- -> or Enter to toggle",
+        "<- -> to cycle",
+        "<- -> to cycle",
         "<- -> to cycle",
         "<- -> or Enter to toggle",
         "<- -> or Enter to toggle",
@@ -408,6 +429,15 @@ static void draw_settings(void)
             else
                 snprintf(valstr, sizeof(valstr), "(none detected)");
             break;
+        case SETTING_AUDIO_PLAY_DEV:
+            snprintf(valstr, sizeof(valstr), "%s",
+                     config.audio_play_device[0] ? config.audio_play_device
+                                                 : "(default)");
+            break;
+        case SETTING_AUDIO_BUFFER:
+            snprintf(valstr, sizeof(valstr), "%d frames",
+                     config.audio_buffer_frames);
+            break;
         case SETTING_AUDIO_MUTE_SCAN:
             snprintf(valstr, sizeof(valstr), "%s",
                      config.audio_mute_scan ? "Yes" : "No");
@@ -445,6 +475,12 @@ static void draw_settings(void)
                 mvprintw(row, 44, "no capture devices detected");
             else if (idx >= 0 && audio_dev_descs[idx][0])
                 mvprintw(row, 44, "<-> cycle  %.30s", audio_dev_descs[idx]);
+            else
+                mvprintw(row, 44, "%s", base_hints[i]);
+        } else if (i == SETTING_AUDIO_PLAY_DEV) {
+            int idx = audio_play_dev_idx();
+            if (idx >= 0 && idx < audio_play_dev_count && audio_play_dev_descs[idx][0])
+                mvprintw(row, 44, "<-> cycle  %.30s", audio_play_dev_descs[idx]);
             else
                 mvprintw(row, 44, "%s", base_hints[i]);
         } else if (i == SETTING_AUDIO_ENABLE && audio.errmsg[0]) {
@@ -768,12 +804,33 @@ static void handle_settings_key(int ch)
                 int idx = audio_dev_idx();
                 idx = right ? (idx + 1) % audio_dev_count
                             : (idx + audio_dev_count - 1) % audio_dev_count;
-                strncpy(config.audio_device, audio_dev_names[idx], 63);
-                config.audio_device[63] = '\0';
-                if (config.audio_enabled)
-                    audio_start(&audio, config.audio_device);
+                strncpy(config.audio_device, audio_dev_names[idx],
+                        sizeof(config.audio_device) - 1);
+                config.audio_device[sizeof(config.audio_device) - 1] = '\0';
+                if (config.audio_enabled) audio_apply();
                 config_save(&config);
             }
+        } else if (settings_sel == SETTING_AUDIO_PLAY_DEV) {
+            if (audio_play_dev_count > 0) {
+                int idx = audio_play_dev_idx();
+                idx = right ? (idx + 1) % audio_play_dev_count
+                            : (idx + audio_play_dev_count - 1) % audio_play_dev_count;
+                strncpy(config.audio_play_device, audio_play_dev_names[idx],
+                        sizeof(config.audio_play_device) - 1);
+                config.audio_play_device[sizeof(config.audio_play_device) - 1] = '\0';
+                if (config.audio_enabled) audio_apply();
+                config_save(&config);
+            }
+        } else if (settings_sel == SETTING_AUDIO_BUFFER) {
+            static const int bufsizes[] = { 512, 1024, 2048, 4096, 8192 };
+            static const int nb = 5;
+            int idx = 0;
+            for (int k = 0; k < nb; k++)
+                if (bufsizes[k] == config.audio_buffer_frames) { idx = k; break; }
+            idx = right ? (idx + 1) % nb : (idx + nb - 1) % nb;
+            config.audio_buffer_frames = bufsizes[idx];
+            if (config.audio_enabled) audio_apply();
+            config_save(&config);
         } else if (settings_sel == SETTING_AUDIO_MUTE_SCAN) {
             config.audio_mute_scan = !config.audio_mute_scan;
             config_save(&config);
@@ -1150,22 +1207,25 @@ static void print_version(void)
     printf("ncradio " VERSION "\n");
     printf("Built:  " __DATE__ " " __TIME__ "\n\n");
 
-#ifdef HAVE_AUDIO
-    printf("  Audio (ALSA):          yes — libasound %s\n",
+#ifdef HAVE_PIPEWIRE
+    printf("  Audio backend:         PipeWire %s\n",
+           audio_pipewire_version());
+#elif defined(HAVE_AUDIO)
+    printf("  Audio backend:         ALSA — libasound %s\n",
            audio_alsa_version());
 #else
-    printf("  Audio (ALSA):          no\n");
+    printf("  Audio backend:         disabled\n");
 #endif
 
 #ifdef HAVE_UDEV
 # ifdef LIBUDEV_VERSION
-    printf("  ALSA autodetect:       udev + sysfs — libudev %s\n",
+    printf("  Device autodetect:     udev + sysfs — libudev %s\n",
            LIBUDEV_VERSION);
 # else
-    printf("  ALSA autodetect:       udev + sysfs\n");
+    printf("  Device autodetect:     udev + sysfs\n");
 # endif
-#else
-    printf("  ALSA autodetect:       sysfs only\n");
+#elif defined(HAVE_AUDIO)
+    printf("  Device autodetect:     sysfs only\n");
 #endif
 
 #ifdef HAVE_LAME
@@ -1202,9 +1262,11 @@ int main(int argc, char *argv[])
         radio_set_freq(&radio, config.last_freq_hz);
 
 #ifdef HAVE_AUDIO
-    /* Enumerate ALSA capture devices for the settings panel */
+    /* Enumerate audio capture and playback devices for the settings panel */
     audio_enum_devices(audio_dev_names, audio_dev_descs,
                        &audio_dev_count, AUDIO_DEV_MAX);
+    audio_enum_play_devices(audio_play_dev_names, audio_play_dev_descs,
+                            &audio_play_dev_count, AUDIO_DEV_MAX);
 
     /* Auto-enable on first run: if the user has never made an explicit choice
        (enabled=0 and no device saved), try autodetect and enable if found. */

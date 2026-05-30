@@ -1,7 +1,7 @@
 -include config.mk
 
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -D_POSIX_C_SOURCE=199309L $(AUDIO_CFLAGS)
+CFLAGS  = -Wall -Wextra -O2 -D_POSIX_C_SOURCE=200809L $(AUDIO_CFLAGS)
 LDFLAGS = -lncurses -lpthread $(AUDIO_LIBS)
 
 TARGET  = ncradio

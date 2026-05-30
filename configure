@@ -4,27 +4,30 @@
 AUDIO=auto
 UDEV=auto
 LAME=auto
+PIPEWIRE=auto
 
 for arg in "$@"; do
     case "$arg" in
-        --disable-audio) AUDIO=no ;;
-        --enable-audio)  AUDIO=yes ;;
-        --disable-udev)  UDEV=no ;;
-        --disable-lame)  LAME=no ;;
+        --disable-audio)    AUDIO=no ;;
+        --enable-audio)     AUDIO=yes ;;
+        --disable-udev)     UDEV=no ;;
+        --disable-lame)     LAME=no ;;
+        --disable-pipewire) PIPEWIRE=no ;;
         --help|-h)
             cat <<EOF
 Usage: ./configure [OPTION]...
 
 Options:
-  --disable-audio   Build without ALSA audio support
-  --enable-audio    Require ALSA audio support (fail if not found)
-  --disable-udev    Disable libudev; use sysfs-only ALSA autodetection
-  --disable-lame    Build without MP3 recording support
-  --help            Show this help
+  --disable-audio     Build without audio support
+  --enable-audio      Require audio support (fail if no backend found)
+  --disable-udev      Disable libudev; use sysfs-only device autodetection
+  --disable-lame      Build without MP3 recording support
+  --disable-pipewire  Use ALSA directly even if PipeWire is available
 
-Without options, audio support is enabled automatically if libasound is found.
-When audio is enabled, libudev is used for ALSA autodetection if available;
-otherwise the build falls back to sysfs-based detection.
+Without options, PipeWire is used when available; otherwise falls back to ALSA.
+When audio is enabled, libudev is used for device autodetection if available.
+With PipeWire, both capture and playback go through PipeWire (no libasound).
+With ALSA, both capture and playback use libasound.
 EOF
             exit 0
             ;;
@@ -37,11 +40,29 @@ EOF
 done
 
 have_audio=no
+have_alsa=no
+have_pipewire=no
+have_udev=no
+have_lame=no
 
-if [ "$AUDIO" != "no" ]; then
+# ── PipeWire (preferred backend) ─────────────────────────────────────────
+if [ "$AUDIO" != "no" ] && [ "$PIPEWIRE" != "no" ]; then
+    printf "checking for libpipewire-0.3... "
+    if pkg-config --exists libpipewire-0.3 2>/dev/null; then
+        have_pipewire=yes
+        have_audio=yes
+        echo "yes ($(pkg-config --modversion libpipewire-0.3))"
+    else
+        echo "no"
+    fi
+fi
+
+# ── ALSA (fallback when PipeWire not available or --disable-pipewire) ────
+if [ "$AUDIO" != "no" ] && [ "$have_pipewire" = "no" ]; then
     printf "checking for libasound... "
 
     if pkg-config --exists alsa 2>/dev/null; then
+        have_alsa=yes
         have_audio=yes
         echo "yes (pkg-config)"
     else
@@ -51,12 +72,13 @@ if [ "$AUDIO" != "no" ]; then
 int main(void) { return 0; }
 EOF
         if ${CC:-gcc} "$_tmpdir/check.c" -lasound -o "$_tmpdir/check" 2>/dev/null; then
+            have_alsa=yes
             have_audio=yes
             echo "yes"
         else
             echo "no"
             if [ "$AUDIO" = "yes" ]; then
-                echo "configure: error: libasound not found (required by --enable-audio)" >&2
+                echo "configure: error: no audio backend found (tried libpipewire-0.3, libasound)" >&2
                 rm -rf "$_tmpdir"
                 exit 1
             fi
@@ -65,8 +87,12 @@ EOF
     fi
 fi
 
-have_udev=no
+if [ "$AUDIO" = "yes" ] && [ "$have_audio" = "no" ]; then
+    echo "configure: error: --enable-audio requires libpipewire-0.3 or libasound" >&2
+    exit 1
+fi
 
+# ── libudev (autodetection helper, useful for both backends) ─────────────
 if [ "$have_audio" = "yes" ] && [ "$UDEV" != "no" ]; then
     printf "checking for libudev... "
 
@@ -89,8 +115,7 @@ EOF
     fi
 fi
 
-have_lame=no
-
+# ── libmp3lame (recording, works with either backend) ────────────────────
 if [ "$have_audio" = "yes" ] && [ "$LAME" != "no" ]; then
     printf "checking for libmp3lame... "
     _tmpdir=$(mktemp -d)
@@ -107,25 +132,32 @@ EOF
     rm -rf "$_tmpdir"
 fi
 
-# Build flag strings
+# ── Build flag strings ────────────────────────────────────────────────────
 if [ "$have_audio" = "yes" ]; then
-    audio_cflags="-DHAVE_AUDIO"
-    audio_libs="-lasound"
-    if [ "$have_udev" = "yes" ]; then
-        audio_cflags="$audio_cflags -DHAVE_UDEV"
-        audio_libs="$audio_libs -ludev"
-        # Embed libudev version (no runtime API exists); best-effort via pkg-config
-        _udev_ver=$(pkg-config --modversion libudev 2>/dev/null)
-        if [ -n "$_udev_ver" ]; then
-            audio_cflags="$audio_cflags -DLIBUDEV_VERSION=\\\"$_udev_ver\\\""
-        fi
-    fi
-    if [ "$have_lame" = "yes" ]; then
-        audio_cflags="$audio_cflags -DHAVE_LAME"
-        audio_libs="$audio_libs -lmp3lame"
-    fi
     audio_srcs="audio.c"
     record_srcs=$([ "$have_lame" = "yes" ] && echo "record.c")
+
+    # Common udev fragment (shared by both backends)
+    udev_cflags=""
+    udev_libs=""
+    if [ "$have_udev" = "yes" ]; then
+        udev_cflags="-DHAVE_UDEV"
+        udev_libs="-ludev"
+        _udev_ver=$(pkg-config --modversion libudev 2>/dev/null)
+        if [ -n "$_udev_ver" ]; then
+            udev_cflags="$udev_cflags -DLIBUDEV_VERSION=\\\"$_udev_ver\\\""
+        fi
+    fi
+    lame_cflags=$([ "$have_lame" = "yes" ] && echo "-DHAVE_LAME")
+    lame_libs=$([ "$have_lame" = "yes" ] && echo "-lmp3lame")
+
+    if [ "$have_pipewire" = "yes" ]; then
+        audio_cflags="-DHAVE_AUDIO -DHAVE_PIPEWIRE $(pkg-config --cflags libpipewire-0.3) $udev_cflags $lame_cflags"
+        audio_libs="$(pkg-config --libs libpipewire-0.3) $udev_libs $lame_libs"
+    else
+        audio_cflags="-DHAVE_AUDIO $udev_cflags $lame_cflags"
+        audio_libs="-lasound $udev_libs $lame_libs"
+    fi
 else
     audio_cflags=""
     audio_libs=""
@@ -144,12 +176,17 @@ EOF
 
 echo ""
 echo "Build configuration:"
-printf "  Audio (ALSA): "
-[ "$have_audio" = "yes" ] && echo "enabled" || echo "disabled"
+if [ "$have_pipewire" = "yes" ]; then
+    printf "  Audio backend:         PipeWire\n"
+elif [ "$have_alsa" = "yes" ]; then
+    printf "  Audio backend:         ALSA\n"
+else
+    printf "  Audio backend:         disabled\n"
+fi
 if [ "$have_audio" = "yes" ]; then
-    printf "  ALSA autodetect via: "
+    printf "  Device autodetect:     "
     [ "$have_udev" = "yes" ] && echo "udev + sysfs fallback" || echo "sysfs"
-    printf "  MP3 recording:        "
+    printf "  MP3 recording:         "
     [ "$have_lame" = "yes" ] && echo "enabled" || echo "disabled (libmp3lame not found)"
 fi
 echo ""

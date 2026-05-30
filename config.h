@@ -12,6 +12,7 @@
 #define DEFAULT_AUDIO_ENABLED            0
 #define DEFAULT_AUDIO_MUTE_SCAN          1
 #define DEFAULT_AUDIO_MUTE_SEEK          1
+#define DEFAULT_AUDIO_BUFFER_FRAMES   4096  /* capture/playback period in frames */
 
 /* Default MP3 recording settings */
 #define DEFAULT_RECORD_BITRATE         128   /* kbps */
@@ -37,9 +38,11 @@ typedef struct {
 
     /* audio settings */
     int      audio_enabled;
-    char     audio_device[64]; /* ALSA capture device, e.g. "hw:2,0" */
-    int      audio_mute_scan;  /* stop audio pipe while scanning */
-    int      audio_mute_seek;  /* stop audio pipe while seeking */
+    char     audio_device[64];      /* capture device / PipeWire source node */
+    char     audio_play_device[64]; /* playback device / PipeWire sink node; empty = default */
+    int      audio_buffer_frames;   /* period size in frames for capture+playback */
+    int      audio_mute_scan;       /* stop audio pipe while scanning */
+    int      audio_mute_seek;       /* stop audio pipe while seeking */
 
     /* MP3 recording settings */
     int      record_bitrate;    /* kbps: 64/96/128/192/256/320 */

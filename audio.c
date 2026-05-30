@@ -1,6 +1,4 @@
 #include "audio.h"
-#include <alsa/asoundlib.h>
-#include <alloca.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -8,14 +6,573 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 #ifdef HAVE_UDEV
 #include <libudev.h>
 #endif
 
+/* ── backend-specific headers ────────────────────────────────────────── */
+#ifdef HAVE_PIPEWIRE
+#include <pipewire/pipewire.h>
+#include <spa/param/audio/format-utils.h>
+#include <spa/param/buffers.h>
+#include <spa/utils/ringbuffer.h>
+#else
+#include <alsa/asoundlib.h>
+#include <alloca.h>
+#endif
+
+/* ═══════════════════════════════════════════════════════════════════════
+   PipeWire backend — capture and playback both via PipeWire
+   ═══════════════════════════════════════════════════════════════════════ */
+#ifdef HAVE_PIPEWIRE
+
+#define PW_RING_BYTES (1u << 21)   /* 2 MiB — several seconds of headroom */
+
+/* State shared between the audio thread and PipeWire callbacks. */
+struct pw_full_audio {
+    struct pw_thread_loop *loop;
+    struct pw_context     *context;
+    struct pw_core        *core;
+    struct pw_stream      *cap;    /* PW_DIRECTION_INPUT  — radio source  */
+    struct pw_stream      *play;   /* PW_DIRECTION_OUTPUT — speaker sink  */
+    struct spa_hook        cap_listener;
+    struct spa_hook        play_listener;
+    struct spa_ringbuffer  ring;
+    uint8_t               *ring_buf;
+    uint32_t               stride;     /* bytes per frame, set before loop starts */
+    char                   errmsg[128];
+    Audio                 *audio;
+};
+
+/* ── capture callbacks ───────────────────────────────────────────────── */
+
+static void pw_cap_param_changed(void *data, uint32_t id,
+                                 const struct spa_pod *param)
+{
+    struct pw_full_audio *s = data;
+    if (!param || id != SPA_PARAM_Format) return;
+    uint8_t buf[1024];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+    const struct spa_pod *params[1];
+    params[0] = spa_pod_builder_add_object(&b,
+        SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+        SPA_PARAM_BUFFERS_size, SPA_POD_Int(4096 * (int)s->stride));
+    pw_stream_update_params(s->cap, params, 1);
+}
+
+static void pw_cap_process(void *data)
+{
+    struct pw_full_audio *s = data;
+    struct pw_buffer *b = pw_stream_dequeue_buffer(s->cap);
+    if (!b) return;
+
+    struct spa_data *d = &b->buffer->datas[0];
+    uint32_t size = d->chunk->size;
+    void    *pcm  = (uint8_t *)d->data + d->chunk->offset;
+
+    if (size > 0) {
+        uint32_t index;
+        int32_t filled = spa_ringbuffer_get_write_index(&s->ring, &index);
+        if ((uint32_t)(PW_RING_BYTES - filled) >= size) {
+            spa_ringbuffer_write_data(&s->ring, s->ring_buf, PW_RING_BYTES,
+                                      index & (PW_RING_BYTES - 1),
+                                      pcm, size);
+            spa_ringbuffer_write_update(&s->ring, (int32_t)(index + size));
+        }
+
+        pthread_mutex_lock(&s->audio->rec_lock);
+        if (s->audio->rec_fn && s->stride > 0) {
+            int frames = (int)(size / s->stride);
+            s->audio->rec_fn(s->audio->rec_ctx, pcm, frames,
+                             s->audio->channels);
+        }
+        pthread_mutex_unlock(&s->audio->rec_lock);
+    }
+
+    pw_stream_queue_buffer(s->cap, b);
+}
+
+static const struct pw_stream_events pw_cap_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .param_changed = pw_cap_param_changed,
+    .process       = pw_cap_process,
+};
+
+/* ── playback callbacks ──────────────────────────────────────────────── */
+
+static void pw_play_param_changed(void *data, uint32_t id,
+                                  const struct spa_pod *param)
+{
+    struct pw_full_audio *s = data;
+    if (!param || id != SPA_PARAM_Format) return;
+    uint8_t buf[1024];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+    const struct spa_pod *params[1];
+    params[0] = spa_pod_builder_add_object(&b,
+        SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+        SPA_PARAM_BUFFERS_size, SPA_POD_Int(4096 * (int)s->stride));
+    pw_stream_update_params(s->play, params, 1);
+}
+
+static void pw_play_process(void *data)
+{
+    struct pw_full_audio *s = data;
+    struct pw_buffer *b = pw_stream_dequeue_buffer(s->play);
+    if (!b) return;
+
+    struct spa_data *d = &b->buffer->datas[0];
+    uint32_t req = b->requested > 0
+                   ? (uint32_t)(b->requested * s->stride)
+                   : d->maxsize;
+    if (req > d->maxsize) req = d->maxsize;
+
+    uint32_t index;
+    int32_t avail = spa_ringbuffer_get_read_index(&s->ring, &index);
+    uint32_t fill = 0;
+    if (avail > 0)
+        fill = (uint32_t)avail < req ? (uint32_t)avail : req;
+
+    if (fill > 0) {
+        spa_ringbuffer_read_data(&s->ring, s->ring_buf, PW_RING_BYTES,
+                                 index & (PW_RING_BYTES - 1),
+                                 d->data, fill);
+        spa_ringbuffer_read_update(&s->ring, (int32_t)(index + fill));
+    }
+    if (fill < req)
+        memset((uint8_t *)d->data + fill, 0, req - fill);
+
+    d->chunk->offset = 0;
+    d->chunk->stride = (int32_t)s->stride;
+    d->chunk->size   = req;
+    pw_stream_queue_buffer(s->play, b);
+}
+
+static const struct pw_stream_events pw_play_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .param_changed = pw_play_param_changed,
+    .process       = pw_play_process,
+};
+
+/* ── audio transfer thread (PipeWire) ────────────────────────────────── */
+
+static void *audio_fn(void *arg)
+{
+    Audio *a = arg;
+    struct pw_full_audio s;
+    memset(&s, 0, sizeof(s));
+    s.audio = a;
+
+    /* Fixed format: S16_LE stereo 48 kHz. PipeWire resamples as needed. */
+    const uint32_t rate = 48000, channels = 2;
+    s.stride    = channels * 2;
+    a->rate     = rate;
+    a->channels = (int)channels;
+
+    s.ring_buf = malloc(PW_RING_BYTES);
+    if (!s.ring_buf) {
+        snprintf(a->errmsg, sizeof(a->errmsg), "out of memory");
+        goto done;
+    }
+    spa_ringbuffer_init(&s.ring);
+    pw_init(NULL, NULL);
+
+    s.loop = pw_thread_loop_new("ncradio", NULL);
+    if (!s.loop) {
+        snprintf(a->errmsg, sizeof(a->errmsg), "pw_thread_loop_new failed");
+        goto done;
+    }
+    s.context = pw_context_new(pw_thread_loop_get_loop(s.loop), NULL, 0);
+    if (!s.context) {
+        snprintf(a->errmsg, sizeof(a->errmsg), "pw_context_new failed");
+        goto done;
+    }
+    if (pw_thread_loop_start(s.loop) < 0) {
+        snprintf(a->errmsg, sizeof(a->errmsg), "pw_thread_loop_start failed");
+        goto done;
+    }
+
+    pw_thread_loop_lock(s.loop);
+
+    s.core = pw_context_connect(s.context, NULL, 0);
+    if (!s.core) {
+        snprintf(a->errmsg, sizeof(a->errmsg),
+                 "cannot connect to PipeWire daemon");
+        goto fail_locked;
+    }
+
+    /* Audio format shared by both streams */
+    struct spa_audio_info_raw fmt = {
+        .format   = SPA_AUDIO_FORMAT_S16_LE,
+        .rate     = rate,
+        .channels = channels,
+    };
+    fmt.position[0] = SPA_AUDIO_CHANNEL_FL;
+    fmt.position[1] = SPA_AUDIO_CHANNEL_FR;
+
+    /* Capture stream (radio source → us) */
+    {
+        struct pw_properties *props = pw_properties_new(
+            PW_KEY_MEDIA_TYPE,     "Audio",
+            PW_KEY_MEDIA_CATEGORY, "Capture",
+            PW_KEY_MEDIA_ROLE,     "Music",
+            NULL);
+        if (a->device[0])
+            pw_properties_set(props, PW_KEY_TARGET_OBJECT, a->device);
+
+        s.cap = pw_stream_new(s.core, "ncradio-cap", props);
+        if (!s.cap) {
+            snprintf(a->errmsg, sizeof(a->errmsg),
+                     "pw_stream_new (capture) failed");
+            goto fail_locked;
+        }
+        pw_stream_add_listener(s.cap, &s.cap_listener, &pw_cap_events, &s);
+
+        uint8_t pod_buf[1024];
+        struct spa_pod_builder b = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
+        const struct spa_pod *params[1] = {
+            spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &fmt)
+        };
+        pw_stream_connect(s.cap, PW_DIRECTION_INPUT, PW_ID_ANY,
+                          PW_STREAM_FLAG_AUTOCONNECT |
+                          PW_STREAM_FLAG_MAP_BUFFERS |
+                          PW_STREAM_FLAG_RT_PROCESS,
+                          params, 1);
+    }
+
+    /* Playback stream (us → speaker sink) */
+    {
+        struct pw_properties *props = pw_properties_new(
+            PW_KEY_MEDIA_TYPE,     "Audio",
+            PW_KEY_MEDIA_CATEGORY, "Playback",
+            PW_KEY_MEDIA_ROLE,     "Music",
+            NULL);
+        const char *tgt = a->play_device[0] ? a->play_device : NULL;
+        if (tgt)
+            pw_properties_set(props, PW_KEY_TARGET_OBJECT, tgt);
+
+        s.play = pw_stream_new(s.core, "ncradio", props);
+        if (!s.play) {
+            snprintf(a->errmsg, sizeof(a->errmsg),
+                     "pw_stream_new (playback) failed");
+            goto fail_locked;
+        }
+        pw_stream_add_listener(s.play, &s.play_listener, &pw_play_events, &s);
+
+        uint8_t pod_buf[1024];
+        struct spa_pod_builder b = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
+        const struct spa_pod *params[1] = {
+            spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &fmt)
+        };
+        pw_stream_connect(s.play, PW_DIRECTION_OUTPUT, PW_ID_ANY,
+                          PW_STREAM_FLAG_AUTOCONNECT |
+                          PW_STREAM_FLAG_MAP_BUFFERS |
+                          PW_STREAM_FLAG_RT_PROCESS,
+                          params, 1);
+    }
+
+    pw_thread_loop_unlock(s.loop);
+
+    /* Park this thread until audio_stop() clears a->running. */
+    {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 }; /* 10 ms */
+        while (a->running && !s.errmsg[0])
+            nanosleep(&ts, NULL);
+        if (s.errmsg[0])
+            snprintf(a->errmsg, sizeof(a->errmsg), "%s", s.errmsg);
+    }
+    goto cleanup;
+
+fail_locked:
+    pw_thread_loop_unlock(s.loop);
+
+cleanup:
+    if (s.loop) pw_thread_loop_stop(s.loop);
+    if (s.cap)     { pw_stream_destroy(s.cap);      s.cap     = NULL; }
+    if (s.play)    { pw_stream_destroy(s.play);     s.play    = NULL; }
+    if (s.core)    { pw_core_disconnect(s.core);    s.core    = NULL; }
+    if (s.context) { pw_context_destroy(s.context); s.context = NULL; }
+    if (s.loop)    { pw_thread_loop_destroy(s.loop); s.loop   = NULL; }
+
+done:
+    free(s.ring_buf);
+    a->running = 0;
+    return NULL;
+}
+
+/* ── version ─────────────────────────────────────────────────────────── */
+
+const char *audio_pipewire_version(void)
+{
+    pw_init(NULL, NULL);
+    return pw_get_library_version();
+}
+
+/* ── node enumeration helper ─────────────────────────────────────────── */
+
+struct pw_enum_ctx {
+    char (*names)[AUDIO_DEV_NAMELEN];
+    char (*descs)[AUDIO_DEV_DESCLEN];
+    int  *count;
+    int   max;
+    int   sync_seq;
+    const char          *media_class;
+    struct pw_main_loop *loop;
+    struct spa_hook      core_listener;
+    struct spa_hook      reg_listener;
+};
+
+static void pw_enum_on_global(void *data, uint32_t id, uint32_t permissions,
+                               const char *type, uint32_t version,
+                               const struct spa_dict *props)
+{
+    struct pw_enum_ctx *ctx = data;
+    (void)id; (void)permissions; (void)version;
+    if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0) return;
+    if (*ctx->count >= ctx->max) return;
+    const char *mc = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+    if (!mc || strcmp(mc, ctx->media_class) != 0) return;
+    const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+    const char *desc = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION);
+    if (!name) return;
+    if (!desc || !desc[0]) desc = name;
+    int i = *ctx->count;
+    strncpy(ctx->names[i], name, AUDIO_DEV_NAMELEN - 1);
+    ctx->names[i][AUDIO_DEV_NAMELEN - 1] = '\0';
+    snprintf(ctx->descs[i], AUDIO_DEV_DESCLEN, "%s", desc);
+    (*ctx->count)++;
+}
+
+static void pw_enum_on_global_remove(void *data, uint32_t id)
+{
+    (void)data; (void)id;
+}
+
+static const struct pw_registry_events pw_enum_registry_events = {
+    PW_VERSION_REGISTRY_EVENTS,
+    .global        = pw_enum_on_global,
+    .global_remove = pw_enum_on_global_remove,
+};
+
+static void pw_enum_on_core_done(void *data, uint32_t id, int seq)
+{
+    struct pw_enum_ctx *ctx = data;
+    if ((int)id == PW_ID_CORE && seq == ctx->sync_seq)
+        pw_main_loop_quit(ctx->loop);
+}
+
+static const struct pw_core_events pw_enum_core_events = {
+    PW_VERSION_CORE_EVENTS,
+    .done = pw_enum_on_core_done,
+};
+
+/* Enumerate PipeWire nodes of a given media class, appending to names/descs
+   starting at the current value of *count. */
+static void pw_run_enum(const char *media_class,
+                        char names[][AUDIO_DEV_NAMELEN],
+                        char descs[][AUDIO_DEV_DESCLEN],
+                        int *count, int max)
+{
+    pw_init(NULL, NULL);
+
+    struct pw_main_loop *loop = pw_main_loop_new(NULL);
+    if (!loop) return;
+
+    struct pw_context *ctx = pw_context_new(pw_main_loop_get_loop(loop),
+                                            NULL, 0);
+    if (!ctx) { pw_main_loop_destroy(loop); return; }
+
+    struct pw_core *core = pw_context_connect(ctx, NULL, 0);
+    if (!core) { pw_context_destroy(ctx); pw_main_loop_destroy(loop); return; }
+
+    struct pw_registry *registry =
+        pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
+
+    struct pw_enum_ctx ectx = {
+        .names       = names,
+        .descs       = descs,
+        .count       = count,
+        .max         = max,
+        .media_class = media_class,
+        .loop        = loop,
+    };
+    pw_registry_add_listener(registry, &ectx.reg_listener,
+                             &pw_enum_registry_events, &ectx);
+    pw_core_add_listener(core, &ectx.core_listener,
+                         &pw_enum_core_events, &ectx);
+    ectx.sync_seq = pw_core_sync(core, PW_ID_CORE, 0);
+    pw_main_loop_run(loop);
+
+    spa_hook_remove(&ectx.reg_listener);
+    spa_hook_remove(&ectx.core_listener);
+    pw_proxy_destroy((struct pw_proxy *)registry);
+    pw_core_disconnect(core);
+    pw_context_destroy(ctx);
+    pw_main_loop_destroy(loop);
+}
+
+/* ── capture device enumeration (PipeWire sources) ───────────────────── */
+
+void audio_enum_devices(char names[][AUDIO_DEV_NAMELEN],
+                        char descs[][AUDIO_DEV_DESCLEN],
+                        int *count, int max)
+{
+    *count = 0;
+    pw_run_enum("Audio/Source", names, descs, count, max);
+}
+
+/* ── playback device enumeration (PipeWire sinks) ────────────────────── */
+
+void audio_enum_play_devices(char names[][AUDIO_DEV_NAMELEN],
+                             char descs[][AUDIO_DEV_DESCLEN],
+                             int *count, int max)
+{
+    *count = 0;
+    if (max < 1) return;
+
+    /* Index 0 is always the default (empty name → PipeWire auto-routes) */
+    names[0][0] = '\0';
+    strncpy(descs[0], "(default)", AUDIO_DEV_DESCLEN - 1);
+    descs[0][AUDIO_DEV_DESCLEN - 1] = '\0';
+    *count = 1;
+
+    /* Append enumerated sinks starting at index 1 */
+    pw_run_enum("Audio/Sink", names, descs, count, max);
+}
+
+/* ── PipeWire source detection for autodetect ────────────────────────── */
+
+struct pw_detect_ctx {
+    struct pw_main_loop *loop;
+    struct spa_hook      core_listener;
+    struct spa_hook      reg_listener;
+    int                  sync_seq;
+    const char          *card_id;    /* ALSA card id/number to match */
+    int                  is_numeric; /* card_id is a decimal number   */
+    char                 out[AUDIO_DEV_NAMELEN];
+    int                  found;
+};
+
+static void pw_detect_global(void *data, uint32_t id, uint32_t permissions,
+                              const char *type, uint32_t version,
+                              const struct spa_dict *props)
+{
+    struct pw_detect_ctx *ctx = data;
+    (void)id; (void)permissions; (void)version;
+    if (ctx->found) return;
+    if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0) return;
+    const char *mc = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+    if (!mc || strcmp(mc, "Audio/Source") != 0) return;
+
+    const char *node_name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+    if (!node_name) return;
+
+    /* Primary match: ALSA card ID property */
+    const char *alsa_id = spa_dict_lookup(props, "api.alsa.card.id");
+    if (alsa_id && strcmp(alsa_id, ctx->card_id) == 0) {
+        strncpy(ctx->out, node_name, AUDIO_DEV_NAMELEN - 1);
+        ctx->out[AUDIO_DEV_NAMELEN - 1] = '\0';
+        ctx->found = 1;
+        return;
+    }
+
+    /* Secondary match: ALSA card number property (when card_id is numeric) */
+    if (ctx->is_numeric) {
+        const char *alsa_card = spa_dict_lookup(props, "api.alsa.card");
+        if (alsa_card && strcmp(alsa_card, ctx->card_id) == 0) {
+            strncpy(ctx->out, node_name, AUDIO_DEV_NAMELEN - 1);
+            ctx->out[AUDIO_DEV_NAMELEN - 1] = '\0';
+            ctx->found = 1;
+            return;
+        }
+    }
+
+    /* Fallback: card id appears as a substring of the node name */
+    if (strstr(node_name, ctx->card_id)) {
+        strncpy(ctx->out, node_name, AUDIO_DEV_NAMELEN - 1);
+        ctx->out[AUDIO_DEV_NAMELEN - 1] = '\0';
+        ctx->found = 1;
+    }
+}
+
+static void pw_detect_global_remove(void *data, uint32_t id)
+{
+    (void)data; (void)id;
+}
+
+static const struct pw_registry_events pw_detect_registry_events = {
+    PW_VERSION_REGISTRY_EVENTS,
+    .global        = pw_detect_global,
+    .global_remove = pw_detect_global_remove,
+};
+
+static void pw_detect_core_done(void *data, uint32_t id, int seq)
+{
+    struct pw_detect_ctx *ctx = data;
+    if ((int)id == PW_ID_CORE && seq == ctx->sync_seq)
+        pw_main_loop_quit(ctx->loop);
+}
+
+static const struct pw_core_events pw_detect_core_events = {
+    PW_VERSION_CORE_EVENTS,
+    .done = pw_detect_core_done,
+};
+
+/* Find a PipeWire Audio/Source node that corresponds to the given ALSA
+   card identifier (ID string or card number). Returns 1 on success. */
+static int pw_detect_source(const char *card_id, char *out, int out_size)
+{
+    if (out_size > 0) out[0] = '\0';
+    pw_init(NULL, NULL);
+
+    struct pw_main_loop *loop = pw_main_loop_new(NULL);
+    if (!loop) return 0;
+    struct pw_context *ctx =
+        pw_context_new(pw_main_loop_get_loop(loop), NULL, 0);
+    if (!ctx) { pw_main_loop_destroy(loop); return 0; }
+    struct pw_core *core = pw_context_connect(ctx, NULL, 0);
+    if (!core) { pw_context_destroy(ctx); pw_main_loop_destroy(loop); return 0; }
+
+    struct pw_registry *registry =
+        pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
+
+    struct pw_detect_ctx dctx = {
+        .loop       = loop,
+        .card_id    = card_id,
+        .is_numeric = (card_id[0] >= '0' && card_id[0] <= '9'),
+        .found      = 0,
+    };
+    pw_registry_add_listener(registry, &dctx.reg_listener,
+                             &pw_detect_registry_events, &dctx);
+    pw_core_add_listener(core, &dctx.core_listener,
+                         &pw_detect_core_events, &dctx);
+    dctx.sync_seq = pw_core_sync(core, PW_ID_CORE, 0);
+    pw_main_loop_run(loop);
+
+    spa_hook_remove(&dctx.reg_listener);
+    spa_hook_remove(&dctx.core_listener);
+    pw_proxy_destroy((struct pw_proxy *)registry);
+    pw_core_disconnect(core);
+    pw_context_destroy(ctx);
+    pw_main_loop_destroy(loop);
+
+    if (dctx.found) {
+        strncpy(out, dctx.out, (size_t)(out_size - 1));
+        out[out_size - 1] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   ALSA backend — capture and playback both via libasound
+   ═══════════════════════════════════════════════════════════════════════ */
+#else /* !HAVE_PIPEWIRE */
+
 /* Candidate capture rates tried in preference order (highest first). */
 static const unsigned int RATES[] = { 96000, 48000, 44100, 32000, 22050, 16000, 0 };
 
-/* ── audio transfer thread ───────────────────────────────────────────── */
+/* ── audio transfer thread (ALSA) ────────────────────────────────────── */
 
 static void *audio_fn(void *arg)
 {
@@ -24,14 +581,15 @@ static void *audio_fn(void *arg)
     snd_pcm_t *play = NULL;
     void      *buf  = NULL;
 
-    /* Open capture device */
+    snd_pcm_uframes_t period = a->buffer_frames > 0 ? a->buffer_frames : 4096;
+    const char *play_dev = a->play_device[0] ? a->play_device : "default";
+
     if (snd_pcm_open(&cap, a->device, SND_PCM_STREAM_CAPTURE, 0) < 0) {
         snprintf(a->errmsg, sizeof(a->errmsg),
                  "cannot open '%s'", a->device);
         goto done;
     }
 
-    /* Probe supported sample rate (snd_pcm_hw_params_test_rate is non-modifying) */
     snd_pcm_hw_params_t *cap_hw;
     snd_pcm_hw_params_alloca(&cap_hw);
     snd_pcm_hw_params_any(cap, cap_hw);
@@ -44,7 +602,6 @@ static void *audio_fn(void *arg)
         }
     }
 
-    /* Configure capture — try stereo, fall back to mono */
     snd_pcm_hw_params_any(cap, cap_hw);
     snd_pcm_hw_params_set_access(cap, cap_hw, SND_PCM_ACCESS_RW_INTERLEAVED);
     snd_pcm_hw_params_set_format(cap, cap_hw, SND_PCM_FORMAT_S16_LE);
@@ -56,8 +613,6 @@ static void *audio_fn(void *arg)
     }
 
     snd_pcm_hw_params_set_rate(cap, cap_hw, rate, 0);
-
-    snd_pcm_uframes_t period = 4096;
     snd_pcm_hw_params_set_period_size_near(cap, cap_hw, &period, 0);
 
     if (snd_pcm_hw_params(cap, cap_hw) < 0) {
@@ -76,10 +631,16 @@ static void *audio_fn(void *arg)
         goto done;
     }
 
-    /* Open and configure playback ("default" = PulseAudio/PipeWire/hw) */
-    if (snd_pcm_open(&play, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) {
+    size_t buf_bytes = period * (size_t)channels * 2;
+    buf = malloc(buf_bytes);
+    if (!buf) {
+        snprintf(a->errmsg, sizeof(a->errmsg), "out of memory");
+        goto done;
+    }
+
+    if (snd_pcm_open(&play, play_dev, SND_PCM_STREAM_PLAYBACK, 0) < 0) {
         snprintf(a->errmsg, sizeof(a->errmsg),
-                 "cannot open default playback device");
+                 "cannot open playback device '%s'", play_dev);
         goto done;
     }
 
@@ -91,22 +652,17 @@ static void *audio_fn(void *arg)
     snd_pcm_hw_params_set_channels(play, play_hw, (unsigned int)channels);
     snd_pcm_hw_params_set_rate_near(play, play_hw, &rate, 0);
 
+    snd_pcm_uframes_t play_period = period;
+    snd_pcm_uframes_t play_buffer = period * 4;
+    snd_pcm_hw_params_set_period_size_near(play, play_hw, &play_period, 0);
+    snd_pcm_hw_params_set_buffer_size_near(play, play_hw, &play_buffer);
+
     if (snd_pcm_hw_params(play, play_hw) < 0) {
-        snprintf(a->errmsg, sizeof(a->errmsg),
-                 "cannot configure playback device");
+        snprintf(a->errmsg, sizeof(a->errmsg), "cannot configure playback device");
         goto done;
     }
+    snd_pcm_prepare(play);
 
-    /* Transfer buffer: one period of S16_LE interleaved samples */
-    size_t buf_bytes = period * (size_t)channels * 2;
-    buf = malloc(buf_bytes);
-    if (!buf) {
-        snprintf(a->errmsg, sizeof(a->errmsg), "out of memory");
-        goto done;
-    }
-
-    /* Main transfer loop — snd_pcm_readi blocks for one period (~100 ms),
-       auto-starts capture after snd_pcm_recover, and checks running on wakeup. */
     while (a->running) {
         snd_pcm_sframes_t n = snd_pcm_readi(cap, buf, period);
         if (!a->running) break;
@@ -117,14 +673,13 @@ static void *audio_fn(void *arg)
             }
             continue;
         }
-
         snd_pcm_sframes_t w = snd_pcm_writei(play, buf, (snd_pcm_uframes_t)n);
-        if (w < 0)
-            snd_pcm_recover(play, (int)w, 1);
-
+        if (w < 0) {
+            if (snd_pcm_recover(play, (int)w, 1) < 0)
+                snd_pcm_prepare(play);
+        }
         pthread_mutex_lock(&a->rec_lock);
-        if (a->rec_fn)
-            a->rec_fn(a->rec_ctx, buf, (int)n, a->channels);
+        if (a->rec_fn) a->rec_fn(a->rec_ctx, buf, (int)n, a->channels);
         pthread_mutex_unlock(&a->rec_lock);
     }
 
@@ -136,7 +691,85 @@ done:
     return NULL;
 }
 
-/* ── public API ──────────────────────────────────────────────────────── */
+/* ── version ─────────────────────────────────────────────────────────── */
+
+const char *audio_alsa_version(void)
+{
+    return snd_asoundlib_version();
+}
+
+/* ── device enumeration (ALSA) ───────────────────────────────────────── */
+
+static void enum_pcm_devices(char names[][AUDIO_DEV_NAMELEN],
+                             char descs[][AUDIO_DEV_DESCLEN],
+                             int *count, int max,
+                             snd_pcm_stream_t stream)
+{
+    int card = -1;
+    while (*count < max && snd_card_next(&card) >= 0 && card >= 0) {
+        char ctl_name[16];
+        snprintf(ctl_name, sizeof(ctl_name), "hw:%d", card);
+
+        snd_ctl_t *ctl;
+        if (snd_ctl_open(&ctl, ctl_name, 0) < 0) continue;
+
+        snd_ctl_card_info_t *ci;
+        snd_ctl_card_info_alloca(&ci);
+        if (snd_ctl_card_info(ctl, ci) < 0) { snd_ctl_close(ctl); continue; }
+
+        const char *card_id   = snd_ctl_card_info_get_id(ci);
+        const char *card_name = snd_ctl_card_info_get_name(ci);
+
+        int dev = -1;
+        while (*count < max &&
+               snd_ctl_pcm_next_device(ctl, &dev) >= 0 && dev >= 0) {
+            snd_pcm_info_t *pi;
+            snd_pcm_info_alloca(&pi);
+            snd_pcm_info_set_device(pi, (unsigned int)dev);
+            snd_pcm_info_set_subdevice(pi, 0);
+            snd_pcm_info_set_stream(pi, stream);
+            if (snd_ctl_pcm_info(ctl, pi) < 0) continue;
+
+            const char *dev_name = snd_pcm_info_get_name(pi);
+            snprintf(names[*count], AUDIO_DEV_NAMELEN,
+                     "hw:CARD=%s,DEV=%d", card_id, dev);
+            snprintf(descs[*count], AUDIO_DEV_DESCLEN,
+                     "%s, %s", card_name, dev_name ? dev_name : "");
+            (*count)++;
+        }
+        snd_ctl_close(ctl);
+    }
+}
+
+void audio_enum_devices(char names[][AUDIO_DEV_NAMELEN],
+                        char descs[][AUDIO_DEV_DESCLEN],
+                        int *count, int max)
+{
+    *count = 0;
+    enum_pcm_devices(names, descs, count, max, SND_PCM_STREAM_CAPTURE);
+}
+
+void audio_enum_play_devices(char names[][AUDIO_DEV_NAMELEN],
+                             char descs[][AUDIO_DEV_DESCLEN],
+                             int *count, int max)
+{
+    *count = 0;
+    if (max < 1) return;
+
+    /* Index 0 is always the ALSA "default" device */
+    names[0][0] = '\0';
+    strncpy(descs[0], "(default)", AUDIO_DEV_DESCLEN - 1);
+    descs[0][AUDIO_DEV_DESCLEN - 1] = '\0';
+    *count = 1;
+
+    enum_pcm_devices(names, descs, count, max, SND_PCM_STREAM_PLAYBACK);
+}
+
+#endif /* HAVE_PIPEWIRE */
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Public API (shared by both backends)
+   ═══════════════════════════════════════════════════════════════════════ */
 
 int audio_start(Audio *a, const char *device)
 {
@@ -166,14 +799,11 @@ void audio_stop(Audio *a)
     a->started = 0;
 }
 
-const char *audio_alsa_version(void)
-{
-    return snd_asoundlib_version();
-}
+/* ═══════════════════════════════════════════════════════════════════════
+   Sysfs / udev detection helpers (shared by both backends)
+   These functions use only POSIX filesystem and udev APIs, not ALSA.
+   ═══════════════════════════════════════════════════════════════════════ */
 
-/* ── autodetect ──────────────────────────────────────────────────────── */
-
-/* Join two path components into buf; returns 1 on success, 0 if it would overflow. */
 static int path_join(char *buf, size_t size, const char *dir, const char *suffix)
 {
     size_t d = strlen(dir), s = strlen(suffix);
@@ -184,7 +814,6 @@ static int path_join(char *buf, size_t size, const char *dir, const char *suffix
     return 1;
 }
 
-/* Write the first ALSA card found under sound_dir into out. */
 static int detect_card_in_sound_dir(const char *sound_dir, char *out, int out_size)
 {
     DIR *d = opendir(sound_dir);
@@ -218,7 +847,6 @@ static int detect_card_in_sound_dir(const char *sound_dir, char *out, int out_si
     return found;
 }
 
-/* Check base/sound and base/<child>/sound for an ALSA card. */
 static int detect_alsa_in(const char *base, char *out, int out_size)
 {
     char sound_dir[PATH_MAX];
@@ -249,8 +877,6 @@ static int detect_alsa_in(const char *base, char *out, int out_size)
     return found;
 }
 
-/* Resolve a sysfs symlink to its canonical path using chdir+getcwd.
-   Saves and restores the process working directory. */
 static int resolve_syslink(const char *link, char *out, int out_size)
 {
     char saved[PATH_MAX];
@@ -261,7 +887,6 @@ static int resolve_syslink(const char *link, char *out, int out_size)
     return ok;
 }
 
-/* Sysfs-based detection: walk up the sysfs tree from the radio device. */
 static int detect_sysfs(const char *radio_dev, char *out, int out_size)
 {
     const char *devname = strrchr(radio_dev, '/');
@@ -273,7 +898,6 @@ static int detect_sysfs(const char *radio_dev, char *out, int out_size)
     char path[PATH_MAX];
     if (!resolve_syslink(syslink, path, sizeof(path))) return 0;
 
-    /* Strip "<devname>" and "video4linux" to reach the kernel device dir. */
     char *p;
     p = strrchr(path, '/'); if (p) *p = '\0';
     p = strrchr(path, '/'); if (p) *p = '\0';
@@ -292,7 +916,6 @@ static int detect_sysfs(const char *radio_dev, char *out, int out_size)
 }
 
 #ifdef HAVE_UDEV
-/* udev-based detection: match sound cards to the same USB device. */
 static int detect_udev(const char *radio_dev, char *out, int out_size)
 {
     struct udev *udev = udev_new();
@@ -305,7 +928,6 @@ static int detect_udev(const char *radio_dev, char *out, int out_size)
         udev_device_new_from_devnum(udev, 'c', st.st_rdev);
     if (!radio_udev) { udev_unref(udev); return 0; }
 
-    /* Walk to the USB device so sibling interfaces (audio + radio) are matched. */
     struct udev_device *usb = udev_device_get_parent_with_subsystem_devtype(
         radio_udev, "usb", "usb_device");
     if (!usb) {
@@ -332,9 +954,11 @@ static int detect_udev(const char *radio_dev, char *out, int out_size)
             continue;
         }
 
-        struct udev_device *snd_usb = udev_device_get_parent_with_subsystem_devtype(
-            snd, "usb", "usb_device");
-        if (snd_usb && strcmp(usb_syspath, udev_device_get_syspath(snd_usb)) == 0) {
+        struct udev_device *snd_usb =
+            udev_device_get_parent_with_subsystem_devtype(
+                snd, "usb", "usb_device");
+        if (snd_usb &&
+            strcmp(usb_syspath, udev_device_get_syspath(snd_usb)) == 0) {
             const char *id = udev_device_get_sysattr_value(snd, "id");
             if (id && id[0])
                 snprintf(out, (size_t)out_size, "hw:CARD=%s,DEV=0", id);
@@ -354,55 +978,47 @@ static int detect_udev(const char *radio_dev, char *out, int out_size)
 }
 #endif /* HAVE_UDEV */
 
+/* ── autodetect ──────────────────────────────────────────────────────── */
+
 int audio_autodetect(const char *radio_dev, char *out, int out_size)
 {
     if (out_size > 0) out[0] = '\0';
+
+#ifdef HAVE_PIPEWIRE
+    /* Step 1: find the ALSA card identifier via sysfs/udev. */
+    char alsa_dev[AUDIO_DEV_NAMELEN] = "";
+#ifdef HAVE_UDEV
+    if (!detect_udev(radio_dev, alsa_dev, sizeof(alsa_dev)))
+#endif
+        detect_sysfs(radio_dev, alsa_dev, sizeof(alsa_dev));
+
+    if (!alsa_dev[0]) return 0;
+
+    /* Step 2: extract card id/number from the hw: string. */
+    char card_id[64] = "";
+    if (strncmp(alsa_dev, "hw:CARD=", 8) == 0) {
+        const char *p = alsa_dev + 8;
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        if (len < sizeof(card_id)) {
+            memcpy(card_id, p, len);
+            card_id[len] = '\0';
+        }
+    } else if (strncmp(alsa_dev, "hw:", 3) == 0) {
+        strncpy(card_id, alsa_dev + 3, sizeof(card_id) - 1);
+        char *comma = strchr(card_id, ',');
+        if (comma) *comma = '\0';
+    }
+
+    if (!card_id[0]) return 0;
+
+    /* Step 3: find the matching PipeWire Audio/Source node. */
+    return pw_detect_source(card_id, out, out_size);
+
+#else /* ALSA mode: return the hw: string directly */
 #ifdef HAVE_UDEV
     if (detect_udev(radio_dev, out, out_size)) return 1;
 #endif
     return detect_sysfs(radio_dev, out, out_size);
-}
-
-void audio_enum_devices(char names[][AUDIO_DEV_NAMELEN],
-                        char descs[][AUDIO_DEV_DESCLEN],
-                        int *count, int max)
-{
-    *count = 0;
-    int card = -1;
-
-    while (*count < max && snd_card_next(&card) >= 0 && card >= 0) {
-        char ctl_name[16];
-        snprintf(ctl_name, sizeof(ctl_name), "hw:%d", card);
-
-        snd_ctl_t *ctl;
-        if (snd_ctl_open(&ctl, ctl_name, 0) < 0) continue;
-
-        snd_ctl_card_info_t *ci;
-        snd_ctl_card_info_alloca(&ci);
-        if (snd_ctl_card_info(ctl, ci) < 0) { snd_ctl_close(ctl); continue; }
-
-        const char *card_id   = snd_ctl_card_info_get_id(ci);
-        const char *card_name = snd_ctl_card_info_get_name(ci);
-
-        int dev = -1;
-        while (*count < max && snd_ctl_pcm_next_device(ctl, &dev) >= 0 && dev >= 0) {
-            snd_pcm_info_t *pi;
-            snd_pcm_info_alloca(&pi);
-            snd_pcm_info_set_device(pi, (unsigned int)dev);
-            snd_pcm_info_set_subdevice(pi, 0);
-            snd_pcm_info_set_stream(pi, SND_PCM_STREAM_CAPTURE);
-            if (snd_ctl_pcm_info(ctl, pi) < 0) continue;
-
-            const char *dev_name = snd_pcm_info_get_name(pi);
-
-            snprintf(names[*count], AUDIO_DEV_NAMELEN,
-                     "hw:CARD=%s,DEV=%d", card_id, dev);
-
-            snprintf(descs[*count], AUDIO_DEV_DESCLEN,
-                     "%s, %s", card_name, dev_name ? dev_name : "");
-
-            (*count)++;
-        }
-        snd_ctl_close(ctl);
-    }
+#endif /* HAVE_PIPEWIRE */
 }
