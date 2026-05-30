@@ -7,7 +7,7 @@
 
 /* Default scan settings */
 #define DEFAULT_SCAN_STEP_HZ        100000
-#define DEFAULT_SIGNAL_THRESH_PCT       30
+#define DEFAULT_SIGNAL_THRESH_PCT       50
 #define DEFAULT_RDS_NAMES                1
 #define DEFAULT_AUDIO_ENABLED            0
 #define DEFAULT_AUDIO_MUTE_SCAN          1
