@@ -27,11 +27,13 @@ device.
 - Linux kernel with V4L2 radio support (`/dev/radio0`)
 - ALSA (`libasound`) for audio output
 - `libudev` for automatic ALSA device detection (optional; falls back to sysfs)
+- `libmp3lame` for MP3 recording (optional)
 
 **Build:**
 - `ncurses` development headers (`ncurses-devel` / `libncurses-dev`)
 - `alsa-lib` development headers (`alsa-lib-devel` / `libasound2-dev`)
 - `libudev` development headers (`systemd-devel` / `libudev-dev`) — optional
+- `lame` development headers (`lame-devel` / `libmp3lame-dev`) — optional
 - GCC and GNU make
 
 ## Build
@@ -49,6 +51,7 @@ make
 | `--disable-audio` | Build without ALSA audio support |
 | `--enable-audio` | Require ALSA audio (fail if not found) |
 | `--disable-udev` | Use sysfs-only ALSA autodetection; do not link libudev |
+| `--disable-lame` | Build without MP3 recording support |
 
 Optional install to `/usr/local/bin`:
 
@@ -89,6 +92,7 @@ and volume are persisted.
 | `+` or `=` | Volume up (5% step) |
 | `-` | Volume down (5% step) |
 | `m` | Toggle mute |
+| `r` | Start recording to MP3 (requires audio enabled; prompts for filename) |
 | `a` | Add current frequency to presets |
 | `d` | Delete the highlighted preset |
 | `e` | Rename the highlighted preset |
@@ -130,6 +134,26 @@ and volume are persisted.
 | Key | Action |
 |-----|--------|
 | Any key | Cancel seek and restore previous frequency |
+
+### Record filename mode (after pressing `r`)
+
+| Key | Action |
+|-----|--------|
+| Printable chars | Append to filename (`.mp3` added automatically if omitted) |
+| `Backspace` | Delete last character |
+| `Enter` | Start recording |
+| `Esc` | Cancel |
+
+### Recording mode
+
+All tuning, scanning, seeking, mute, and settings keys are blocked while recording.
+
+| Key | Action |
+|-----|--------|
+| `s` or `Esc` | Stop recording and save file |
+| `q` | Stop recording, save file, and quit |
+
+The info row shows `● REC 0:00 filename` with a running elapsed time.
 
 ### Settings panel (after pressing `o`)
 
@@ -259,6 +283,44 @@ arecord -l          # list capture devices
 cat /proc/asound/cards
 ```
 
+## MP3 recording
+
+When compiled with `libmp3lame`, ncradio can record the live audio stream to
+an MP3 file on disk while continuing to play it back.
+
+### Starting a recording
+
+1. Ensure audio is enabled and running (the `[A]` indicator is green).
+2. Press `r` in normal mode.
+3. Type a filename and press `Enter`. The `.mp3` extension is appended
+   automatically if omitted. The file is created in the current working
+   directory; a path prefix like `~/recordings/show` is accepted.
+
+During recording the info row shows:
+
+```
+● REC 0:03  myshow.mp3
+```
+
+with a running elapsed time. All tuning, scanning, seeking, mute, and settings
+operations are blocked. Press `s` or `Esc` to stop and save; press `q` to stop,
+save, and quit.
+
+### Output format
+
+The recording format is configurable from the settings panel:
+
+| Setting | Default | Options |
+|---------|---------|---------|
+| Record bitrate | 128 kbps | 64 / 96 / 128 / 192 / 256 / 320 kbps |
+| Record channels | Stereo | Stereo / Mono |
+| Record sample rate | 44100 Hz | 22050 / 44100 / 48000 Hz |
+
+The encoder receives PCM at the hardware's capture rate and channels and
+resamples / downmixes as needed to produce the configured output format. If the
+capture device can only deliver mono, the output is forced to mono regardless of
+the channels setting.
+
 ## Preset list
 
 Presets are displayed in a multi-column grid that fills the terminal width
@@ -290,6 +352,9 @@ written to `~/.ncradio.conf` on every adjustment.
 | Audio device | (auto) | any detected `hw:X,Y` | ALSA capture device to read audio from |
 | Mute while scanning | Yes | Yes / No | Stop the audio pipe during a band scan |
 | Mute while seeking | Yes | Yes / No | Stop the audio pipe while seeking |
+| Record bitrate | 128 kbps | 64 / 96 / 128 / 192 / 256 / 320 kbps | MP3 bitrate for recordings (shown only when lame is compiled in) |
+| Record channels | Stereo | Stereo / Mono | Output channels for recordings |
+| Record sample rate | 44100 Hz | 22050 / 44100 / 48000 Hz | Output sample rate for recordings |
 
 ## Configuration file
 
@@ -306,6 +371,9 @@ audio_enabled=1
 audio_device=hw:CARD=Si4713,DEV=0
 audio_mute_scan=1
 audio_mute_seek=1
+record_bitrate=128
+record_stereo=1
+record_samplerate=44100
 # stations
 87.90 BBC Radio 1
 91.30
@@ -326,6 +394,9 @@ audio_mute_seek=1
 | `audio_device` | ALSA device (e.g. `hw:CARD=foo,DEV=0`) | Capture device for the audio pipe |
 | `audio_mute_scan` | `0` or `1` | Whether to stop audio during a band scan |
 | `audio_mute_seek` | `0` or `1` | Whether to stop audio while seeking |
+| `record_bitrate` | kbps (e.g. `128`) | MP3 encoding bitrate |
+| `record_stereo` | `0` or `1` | Output channel count for recordings (1=stereo, 0=mono) |
+| `record_samplerate` | Hz (e.g. `44100`) | Output sample rate for recordings |
 
 **Station lines** — frequency in MHz, optional name after a space. Lines
 starting with `#` are comments.

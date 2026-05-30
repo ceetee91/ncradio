@@ -11,10 +11,12 @@ ncradio/
 ├── rds.h       — RdsDecoder struct and rds_feed() declaration
 ├── audio.c     — ALSA audio pipe (capture → playback thread) + device autodetect
 ├── audio.h     — Audio struct and public function declarations
+├── record.c    — MP3 encoder wrapper (libmp3lame); compiled only with HAVE_LAME
+├── record.h    — Record struct and public function declarations
 ├── config.c    — ~/.ncradio.conf read/write
 ├── config.h    — Config struct and function declarations
 ├── Makefile
-└── configure   — build-time feature detection (libasound, libudev)
+└── configure   — build-time feature detection (libasound, libudev, libmp3lame)
 ```
 
 ## Module responsibilities
@@ -91,7 +93,15 @@ while a->running:
     snd_pcm_readi(cap, buf, period)   — blocks ~100 ms per period
     snd_pcm_writei(play, buf, n)
     snd_pcm_recover on xrun in either direction
+    lock(rec_lock)
+    if rec_fn: rec_fn(rec_ctx, buf, n, channels)
+    unlock(rec_lock)
 ```
+
+The recording hook is called inside `rec_lock` so the main thread can safely
+clear `rec_fn` + `rec_ctx` and then call `record_close` without a race — either
+the audio thread has already returned from the callback, or it holds the lock
+and the main thread blocks until it finishes.
 
 **`audio_enum_devices`** iterates ALSA cards via `snd_card_next` / `snd_ctl_pcm_next_device`
 and emits only physical capture endpoints (`hw:CARD=<id>,DEV=N`), excluding
@@ -104,7 +114,8 @@ thread is running.
 **Thread safety** — `a->rate` and `a->channels` are written once by the thread
 during startup, then only read by the UI thread for display. The benign data
 race on these `int`-sized fields is acceptable; they are informational only.
-`a->errmsg` follows the same pattern.
+`a->errmsg` follows the same pattern. `rec_fn` and `rec_ctx` are protected by
+`rec_lock` (a `pthread_mutex_t` initialized in `audio_start`).
 
 **`audio_autodetect(radio_dev, out, out_size)`** finds the ALSA capture device
 associated with a V4L2 radio device by correlating their kernel sysfs paths.
@@ -124,6 +135,44 @@ Two strategies are tried in order:
    Reads the card `id` sysattr to produce `hw:CARD=<id>,DEV=0`, falling
    back to `hw:N,0` if the id file is absent.
 
+### `record.c` / `record.h`
+
+A thin libmp3lame wrapper, compiled only when `HAVE_LAME` is defined.
+
+**`Record` struct:**
+
+```
+lame        — lame_global_flags encoder context
+fp          — open FILE* for the output .mp3
+mp3buf[]    — 16 KiB staging buffer for lame output
+in_channels — channel count of the PCM being fed (1 or 2)
+```
+
+**`record_open(path, in_rate, in_channels, out_rate, out_channels, bitrate, errmsg, errmsg_size)`**
+
+Initialises lame with:
+- `lame_set_in_samplerate` / `lame_set_num_channels` — from the audio thread's
+  detected hardware parameters
+- `lame_set_out_samplerate` — configurable; 0 or same-as-input means no
+  resampling; otherwise lame resamples internally
+- `lame_set_mode` — `MONO` if either `in_channels` or `out_channels` is 1,
+  else `JOINT_STEREO`
+- `lame_set_brate` — configurable kbps
+- `lame_set_quality(5)` — good quality, low CPU overhead
+
+Opens the output file for writing and returns a `Record *`, or NULL with an
+error message in `errmsg`.
+
+**`record_feed(r, pcm, frames)`** — called from the audio thread (inside
+`rec_lock`) after each capture period:
+- Stereo input: `lame_encode_buffer_interleaved`
+- Mono input: `lame_encode_buffer` with the same pointer for both channels
+- Writes encoded bytes directly to `r->fp`
+
+**`record_close(r)`** — calls `lame_encode_flush` to drain the encoder's
+internal lookahead buffer, writes the remaining bytes, closes the file, and
+frees `r`.
+
 ### `config.c` / `config.h`
 
 Handles `~/.ncradio.conf`. The `Config` struct holds:
@@ -141,6 +190,9 @@ int      audio_enabled                       — 1 = start audio pipe at launch
 char     audio_device[64]                    — ALSA capture device (e.g. "hw:CARD=foo,DEV=0")
 int      audio_mute_scan                     — 1 = stop audio pipe during band scan
 int      audio_mute_seek                     — 1 = stop audio pipe while seeking
+int      record_bitrate                      — MP3 bitrate kbps (64/96/128/192/256/320)
+int      record_stereo                       — 1 = stereo output, 0 = mono
+int      record_samplerate                   — output sample rate Hz (22050/44100/48000)
 ```
 
 **File format:**
@@ -156,6 +208,9 @@ audio_enabled=1
 audio_device=hw:CARD=Si4713,DEV=0   ← string key=value
 audio_mute_scan=1
 audio_mute_seek=1
+record_bitrate=128
+record_stereo=1
+record_samplerate=44100
 # stations
 87.90 BBC Radio 1        ← float [optional name]
 98.50
@@ -248,12 +303,14 @@ Contains all ncurses code, application state, and the main event loop.
 **Application modes (`Mode` enum):**
 
 ```
-M_NORMAL    — browsing presets, listening
-M_TUNING    — user typing a frequency after 't'
-M_SCANNING  — scan thread running
-M_EDITING   — user renaming a preset after 'e'
-M_SETTINGS  — settings panel open after 'o'
-M_SEEKING   — seek thread running
+M_NORMAL      — browsing presets, listening
+M_TUNING      — user typing a frequency after 't'
+M_SCANNING    — scan thread running
+M_EDITING     — user renaming a preset after 'e'
+M_SETTINGS    — settings panel open after 'o'
+M_SEEKING     — seek thread running
+M_RECORD_NAME — user typing a recording filename after 'r' (HAVE_LAME only)
+M_RECORDING   — MP3 recording in progress (HAVE_LAME only)
 ```
 
 **Screen layout — fixed rows on `stdscr`:**
@@ -269,6 +326,8 @@ Row 4          mode info line:
                  M_EDITING            — "Name: ___"
                  M_SCANNING           — scan progress bar
                  M_SEEKING            — "Seeking forward >" / "Seeking backward <"
+                 M_RECORD_NAME        — "Record file: ___"
+                 M_RECORDING          — "● REC 0:00  filename" (red, elapsed time)
 Row 5          horizontal separator
 Rows 6…LINES-4 list area:
                  M_NORMAL/M_TUNING/M_EDITING/M_SEEKING — preset grid
@@ -284,17 +343,20 @@ LINES-1        second help line (M_NORMAL only)
 - `[A!]` red — pipe stopped with an error (error text visible in settings panel)
 - absent — audio disabled in config
 
-**Settings panel** (`draw_settings()`) — seven rows in the list area when audio
-is compiled in:
+**Settings panel** (`draw_settings()`) — seven rows when only audio is compiled
+in; ten rows when both audio and lame are present:
 
 ```
-Row +2   Scan step:            0.10 MHz    <- -> to cycle
-Row +3   Signal threshold:     30%         <- -> to adjust (5% steps)
-Row +4   Save RDS names:       Yes         <- -> or Enter to toggle
-Row +5   Audio output:         On (48000Hz 2ch)  <- -> or Enter to toggle
+Row +2   Scan step:            0.10 MHz         <- -> to cycle
+Row +3   Signal threshold:     30%              <- -> to adjust (5% steps)
+Row +4   Save RDS names:       Yes              <- -> or Enter to toggle
+Row +5   Audio output:         On (48000Hz 2ch) <- -> or Enter to toggle
 Row +6   Audio device:         hw:CARD=foo,DEV=0  <- -> to cycle  <description>
-Row +7   Mute while scanning:  Yes         <- -> or Enter to toggle
-Row +8   Mute while seeking:   Yes         <- -> or Enter to toggle
+Row +7   Mute while scanning:  Yes              <- -> or Enter to toggle
+Row +8   Mute while seeking:   Yes              <- -> or Enter to toggle
+Row +9   Record bitrate:       128 kbps         <- -> to cycle        ← HAVE_LAME
+Row +10  Record channels:      Stereo           <- -> to toggle       ← HAVE_LAME
+Row +11  Record sample rate:   44100 Hz         <- -> to cycle        ← HAVE_LAME
 ```
 
 **`audio_apply()`** — called on startup and whenever audio settings change:
@@ -317,6 +379,20 @@ Row +8   Mute while seeking:   Yes         <- -> or Enter to toggle
    (i.e. no explicit prior choice), call `audio_autodetect`. If a device is
    found, set `audio_enabled = 1`, save both fields, and proceed.
 7. `audio_apply` — start the pipe if enabled.
+
+**Recording** (`M_RECORD_NAME` / `M_RECORDING`, HAVE_LAME only):
+
+- `r` in `M_NORMAL`: if `audio.running`, enter `M_RECORD_NAME`; otherwise show
+  "Enable audio first".
+- `M_RECORD_NAME`: text entry for the output path (`.mp3` auto-appended). On
+  Enter, `record_open` is called with `audio.rate` / `audio.channels` as input
+  parameters and `config.record_*` as output parameters. On success, the
+  `Record *` is installed as `audio.rec_ctx` and `recording_cb` as `audio.rec_fn`
+  inside `audio.rec_lock`, then mode transitions to `M_RECORDING`.
+- `M_RECORDING`: all keys ignored except `s`/`Esc` (stop) and `q` (stop + quit).
+  `recording_stop` locks `rec_lock`, grabs the `Record *`, clears both fields,
+  unlocks, then calls `record_close` — guaranteeing the audio thread is not
+  mid-callback when `record_close` frees the encoder.
 
 **Exit sequence** (`main()` after the event loop):
 
@@ -375,7 +451,15 @@ race).
     │                   ├─ snd_pcm_open(hw:CARD=x,DEV=0, CAPTURE)
     │                   ├─ probe rate, configure S16_LE
     │                   ├─ snd_pcm_open("default", PLAYBACK)
-    │                   └─ snd_pcm_readi → snd_pcm_writei loop
+    │                   └─ snd_pcm_readi → snd_pcm_writei → rec_fn(rec_ctx) loop
+    │
+    ├─ record_open → audio.rec_fn/rec_ctx set ← r key (HAVE_LAME)
+    │       └─ lame_init → lame_init_params → fopen(path)
+    │          [audio thread calls record_feed each period]
+    │
+    ├─ recording_stop                         ← s/Esc/q in M_RECORDING
+    │       └─ lock rec_lock, clear rec_fn/ctx, unlock → record_close
+    │                   └─ lame_encode_flush → fclose
     │
     ├─ config_add / config_del / config_save   → ~/.ncradio.conf
     │
@@ -392,15 +476,19 @@ race).
 
 ## Build
 
-`configure` probes for `libasound` (required for audio) and `libudev`
-(optional; used for ALSA autodetection). It writes `config.mk` with
-`AUDIO_CFLAGS`, `AUDIO_SRCS`, and `AUDIO_LIBS`. The Makefile `-include`s
-`config.mk` and otherwise needs no changes to accommodate new optional
-dependencies.
+`configure` probes for `libasound` (required for audio), `libudev` (optional;
+ALSA autodetection), and `libmp3lame` (optional; MP3 recording). It writes
+`config.mk` with `AUDIO_CFLAGS`, `AUDIO_SRCS`, `AUDIO_LIBS`, and `RECORD_SRCS`.
+The Makefile `-include`s `config.mk` and otherwise needs no changes to
+accommodate new optional dependencies.
 
-The `--disable-udev` flag sets `UDEV=no` before the libudev probe runs,
-producing a build that links only `-lasound` and uses the sysfs detection
-path.
+| Flag | Variable | Effect |
+|------|----------|--------|
+| `--disable-udev` | `UDEV=no` | Skip libudev probe; sysfs-only autodetection |
+| `--disable-lame` | `LAME=no` | Skip libmp3lame probe; no recording support |
+
+When lame is found, `HAVE_LAME` is added to `AUDIO_CFLAGS`, `-lmp3lame` to
+`AUDIO_LIBS`, and `record.c` to `RECORD_SRCS`.
 
 Compiled with `-Wall -Wextra -O2 -D_POSIX_C_SOURCE=199309L`. Linked against
-`-lncurses -lpthread -lasound` (plus `-ludev` when udev is enabled).
+`-lncurses -lpthread -lasound` (plus `-ludev` and/or `-lmp3lame` as detected).
