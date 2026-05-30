@@ -4,6 +4,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <dirent.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#ifdef HAVE_UDEV
+#include <libudev.h>
+#endif
 
 /* Candidate capture rates tried in preference order (highest first). */
 static const unsigned int RATES[] = { 96000, 48000, 44100, 32000, 22050, 16000, 0 };
@@ -151,6 +158,198 @@ void audio_stop(Audio *a)
     a->running = 0;
     pthread_join(a->thread, NULL);
     a->started = 0;
+}
+
+/* ── autodetect ──────────────────────────────────────────────────────── */
+
+/* Join two path components into buf; returns 1 on success, 0 if it would overflow. */
+static int path_join(char *buf, size_t size, const char *dir, const char *suffix)
+{
+    size_t d = strlen(dir), s = strlen(suffix);
+    if (d + 1 + s + 1 > size) return 0;
+    memcpy(buf, dir, d);
+    buf[d] = '/';
+    memcpy(buf + d + 1, suffix, s + 1);
+    return 1;
+}
+
+/* Write the first ALSA card found under sound_dir into out. */
+static int detect_card_in_sound_dir(const char *sound_dir, char *out, int out_size)
+{
+    DIR *d = opendir(sound_dir);
+    if (!d) return 0;
+
+    int found = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strncmp(ent->d_name, "card", 4) != 0 || ent->d_name[4] < '0')
+            continue;
+
+        int card_num = atoi(ent->d_name + 4);
+        char id_path[PATH_MAX];
+        char id[64] = "";
+        snprintf(id_path, sizeof(id_path), "%s/%s/id", sound_dir, ent->d_name);
+        FILE *f = fopen(id_path, "r");
+        if (f) {
+            if (fgets(id, sizeof(id), f))
+                id[strcspn(id, "\n")] = '\0';
+            fclose(f);
+        }
+
+        if (id[0])
+            snprintf(out, (size_t)out_size, "hw:CARD=%s,DEV=0", id);
+        else
+            snprintf(out, (size_t)out_size, "hw:%d,0", card_num);
+        found = 1;
+        break;
+    }
+    closedir(d);
+    return found;
+}
+
+/* Check base/sound and base/<child>/sound for an ALSA card. */
+static int detect_alsa_in(const char *base, char *out, int out_size)
+{
+    char sound_dir[PATH_MAX];
+    struct stat st;
+
+    if (path_join(sound_dir, sizeof(sound_dir), base, "sound") &&
+        stat(sound_dir, &st) == 0 && S_ISDIR(st.st_mode) &&
+        detect_card_in_sound_dir(sound_dir, out, out_size))
+        return 1;
+
+    DIR *d = opendir(base);
+    if (!d) return 0;
+
+    int found = 0;
+    struct dirent *ent;
+    char child[PATH_MAX];
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        if (!path_join(child, sizeof(child), base, ent->d_name)) continue;
+        if (!path_join(sound_dir, sizeof(sound_dir), child, "sound")) continue;
+        if (stat(sound_dir, &st) == 0 && S_ISDIR(st.st_mode) &&
+            detect_card_in_sound_dir(sound_dir, out, out_size)) {
+            found = 1;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+/* Resolve a sysfs symlink to its canonical path using chdir+getcwd.
+   Saves and restores the process working directory. */
+static int resolve_syslink(const char *link, char *out, int out_size)
+{
+    char saved[PATH_MAX];
+    if (!getcwd(saved, sizeof(saved))) return 0;
+    if (chdir(link) != 0) return 0;
+    int ok = (getcwd(out, (size_t)out_size) != NULL);
+    chdir(saved);
+    return ok;
+}
+
+/* Sysfs-based detection: walk up the sysfs tree from the radio device. */
+static int detect_sysfs(const char *radio_dev, char *out, int out_size)
+{
+    const char *devname = strrchr(radio_dev, '/');
+    devname = devname ? devname + 1 : radio_dev;
+
+    char syslink[PATH_MAX];
+    snprintf(syslink, sizeof(syslink), "/sys/class/video4linux/%s", devname);
+
+    char path[PATH_MAX];
+    if (!resolve_syslink(syslink, path, sizeof(path))) return 0;
+
+    /* Strip "<devname>" and "video4linux" to reach the kernel device dir. */
+    char *p;
+    p = strrchr(path, '/'); if (p) *p = '\0';
+    p = strrchr(path, '/'); if (p) *p = '\0';
+
+    char base[PATH_MAX];
+    strncpy(base, path, sizeof(base) - 1);
+    base[sizeof(base) - 1] = '\0';
+
+    for (int level = 0; level < 3; level++) {
+        if (detect_alsa_in(base, out, out_size)) return 1;
+        p = strrchr(base, '/');
+        if (!p) break;
+        *p = '\0';
+    }
+    return 0;
+}
+
+#ifdef HAVE_UDEV
+/* udev-based detection: match sound cards to the same USB device. */
+static int detect_udev(const char *radio_dev, char *out, int out_size)
+{
+    struct udev *udev = udev_new();
+    if (!udev) return 0;
+
+    struct stat st;
+    if (stat(radio_dev, &st) != 0) { udev_unref(udev); return 0; }
+
+    struct udev_device *radio_udev =
+        udev_device_new_from_devnum(udev, 'c', st.st_rdev);
+    if (!radio_udev) { udev_unref(udev); return 0; }
+
+    /* Walk to the USB device so sibling interfaces (audio + radio) are matched. */
+    struct udev_device *usb = udev_device_get_parent_with_subsystem_devtype(
+        radio_udev, "usb", "usb_device");
+    if (!usb) {
+        udev_device_unref(radio_udev);
+        udev_unref(udev);
+        return 0;
+    }
+    const char *usb_syspath = udev_device_get_syspath(usb);
+
+    struct udev_enumerate *en = udev_enumerate_new(udev);
+    udev_enumerate_add_match_subsystem(en, "sound");
+    udev_enumerate_scan_devices(en);
+
+    int found = 0;
+    struct udev_list_entry *entry;
+    udev_list_entry_foreach(entry, udev_enumerate_get_list_entry(en)) {
+        struct udev_device *snd = udev_device_new_from_syspath(
+            udev, udev_list_entry_get_name(entry));
+        if (!snd) continue;
+
+        const char *sysname = udev_device_get_sysname(snd);
+        if (strncmp(sysname, "card", 4) != 0 || sysname[4] < '0') {
+            udev_device_unref(snd);
+            continue;
+        }
+
+        struct udev_device *snd_usb = udev_device_get_parent_with_subsystem_devtype(
+            snd, "usb", "usb_device");
+        if (snd_usb && strcmp(usb_syspath, udev_device_get_syspath(snd_usb)) == 0) {
+            const char *id = udev_device_get_sysattr_value(snd, "id");
+            if (id && id[0])
+                snprintf(out, (size_t)out_size, "hw:CARD=%s,DEV=0", id);
+            else
+                snprintf(out, (size_t)out_size, "hw:%d,0", atoi(sysname + 4));
+            found = 1;
+        }
+
+        udev_device_unref(snd);
+        if (found) break;
+    }
+
+    udev_enumerate_unref(en);
+    udev_device_unref(radio_udev);
+    udev_unref(udev);
+    return found;
+}
+#endif /* HAVE_UDEV */
+
+int audio_autodetect(const char *radio_dev, char *out, int out_size)
+{
+    if (out_size > 0) out[0] = '\0';
+#ifdef HAVE_UDEV
+    if (detect_udev(radio_dev, out, out_size)) return 1;
+#endif
+    return detect_sysfs(radio_dev, out, out_size);
 }
 
 void audio_enum_devices(char names[][AUDIO_DEV_NAMELEN],

@@ -38,8 +38,9 @@
 
 typedef enum { M_NORMAL, M_TUNING, M_SCANNING, M_EDITING, M_SETTINGS, M_SEEKING } Mode;
 
-static Radio  radio;
-static Config config;
+static Radio       radio;
+static Config      config;
+static const char *radio_dev_path = "/dev/radio0";
 static volatile int running = 1;
 static Mode mode = M_NORMAL;
 
@@ -86,15 +87,18 @@ static int audio_dev_idx(void)
     return -1;
 }
 
-/* Start audio if enabled and a device is configured; auto-pick first device
-   if enabled with no device set. */
+/* Start audio if enabled and a device is configured.  If no device is set,
+   attempt autodetection (udev then sysfs); save on success, stay off on failure. */
 static void audio_apply(void)
 {
     if (!config.audio_enabled) { audio_stop(&audio); return; }
-    if (!config.audio_device[0] && audio_dev_count > 0) {
-        strncpy(config.audio_device, audio_dev_names[0], 63);
-        config.audio_device[63] = '\0';
-        config_save(&config);
+    if (!config.audio_device[0]) {
+        char detected[AUDIO_DEV_NAMELEN] = "";
+        if (audio_autodetect(radio_dev_path, detected, sizeof(detected))) {
+            strncpy(config.audio_device, detected, sizeof(config.audio_device) - 1);
+            config.audio_device[sizeof(config.audio_device) - 1] = '\0';
+            config_save(&config);
+        }
     }
     if (config.audio_device[0])
         audio_start(&audio, config.audio_device);
@@ -952,11 +956,10 @@ static void on_signal(int sig) { (void)sig; running = 0; }
 
 int main(int argc, char *argv[])
 {
-    const char *device = "/dev/radio0";
-    if (argc > 1) device = argv[1];
+    if (argc > 1) radio_dev_path = argv[1];
 
-    if (radio_open(&radio, device) < 0) {
-        fprintf(stderr, "ncradio: cannot open %s: %s\n", device, strerror(errno));
+    if (radio_open(&radio, radio_dev_path) < 0) {
+        fprintf(stderr, "ncradio: cannot open %s: %s\n", radio_dev_path, strerror(errno));
         fprintf(stderr, "Usage: %s [/dev/radioN]\n", argv[0]);
         return 1;
     }
@@ -969,6 +972,18 @@ int main(int argc, char *argv[])
     /* Enumerate ALSA capture devices for the settings panel */
     audio_enum_devices(audio_dev_names, audio_dev_descs,
                        &audio_dev_count, AUDIO_DEV_MAX);
+
+    /* Auto-enable on first run: if the user has never made an explicit choice
+       (enabled=0 and no device saved), try autodetect and enable if found. */
+    if (!config.audio_enabled && !config.audio_device[0]) {
+        char detected[AUDIO_DEV_NAMELEN] = "";
+        if (audio_autodetect(radio_dev_path, detected, sizeof(detected))) {
+            config.audio_enabled = 1;
+            strncpy(config.audio_device, detected, sizeof(config.audio_device) - 1);
+            config.audio_device[sizeof(config.audio_device) - 1] = '\0';
+            config_save(&config);
+        }
+    }
 
     /* Start audio pipe if enabled */
     audio_apply();

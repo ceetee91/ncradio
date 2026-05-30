@@ -27,3 +27,9 @@ void audio_stop(Audio *a);
 void audio_enum_devices(char names[][AUDIO_DEV_NAMELEN],
                         char descs[][AUDIO_DEV_DESCLEN],
                         int *count, int max);
+
+/* Detect the ALSA capture device associated with a V4L2 radio device.
+   radio_dev: path like "/dev/radio0"
+   out: receives "hw:CARD=<id>,DEV=0" style string on success
+   Returns 1 if a device was found, 0 otherwise. */
+int audio_autodetect(const char *radio_dev, char *out, int out_size);
