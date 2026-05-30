@@ -1268,6 +1268,25 @@ int main(int argc, char *argv[])
     audio_enum_play_devices(audio_play_dev_names, audio_play_dev_descs,
                             &audio_play_dev_count, AUDIO_DEV_MAX);
 
+    /* Validate devices from config against the live enumerated lists.
+       Clear any that are no longer present so the auto-enable path or
+       audio_apply() falls back to autodetection / the default device. */
+    {
+        int dirty = 0;
+        if (config.audio_device[0] && audio_dev_idx() < 0) {
+            config.audio_device[0] = '\0';
+            dirty = 1;
+        }
+        /* audio_play_dev_idx() returns 0 (the "(default)" slot) when the
+           saved name is non-empty but absent from the list. */
+        if (config.audio_play_device[0] && audio_play_dev_idx() == 0) {
+            config.audio_play_device[0] = '\0';
+            dirty = 1;
+        }
+        if (dirty)
+            config_save(&config);
+    }
+
     /* Auto-enable on first run: if the user has never made an explicit choice
        (enabled=0 and no device saved), try autodetect and enable if found. */
     if (!config.audio_enabled && !config.audio_device[0]) {
