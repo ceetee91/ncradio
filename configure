@@ -114,6 +114,11 @@ if [ "$have_audio" = "yes" ]; then
     if [ "$have_udev" = "yes" ]; then
         audio_cflags="$audio_cflags -DHAVE_UDEV"
         audio_libs="$audio_libs -ludev"
+        # Embed libudev version (no runtime API exists); best-effort via pkg-config
+        _udev_ver=$(pkg-config --modversion libudev 2>/dev/null)
+        if [ -n "$_udev_ver" ]; then
+            audio_cflags="$audio_cflags -DLIBUDEV_VERSION=\\\"$_udev_ver\\\""
+        fi
     fi
     if [ "$have_lame" = "yes" ]; then
         audio_cflags="$audio_cflags -DHAVE_LAME"

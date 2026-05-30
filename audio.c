@@ -166,6 +166,11 @@ void audio_stop(Audio *a)
     a->started = 0;
 }
 
+const char *audio_alsa_version(void)
+{
+    return snd_asoundlib_version();
+}
+
 /* ── autodetect ──────────────────────────────────────────────────────── */
 
 /* Join two path components into buf; returns 1 on success, 0 if it would overflow. */

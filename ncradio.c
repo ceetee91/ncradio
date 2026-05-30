@@ -1143,10 +1143,49 @@ static void handle_key(int ch)
 
 static void on_signal(int sig) { (void)sig; running = 0; }
 
+/* ── version ─────────────────────────────────────────────────────────── */
+
+static void print_version(void)
+{
+    printf("ncradio " VERSION "\n");
+    printf("Built:  " __DATE__ " " __TIME__ "\n\n");
+
+#ifdef HAVE_AUDIO
+    printf("  Audio (ALSA):          yes — libasound %s\n",
+           audio_alsa_version());
+#else
+    printf("  Audio (ALSA):          no\n");
+#endif
+
+#ifdef HAVE_UDEV
+# ifdef LIBUDEV_VERSION
+    printf("  ALSA autodetect:       udev + sysfs — libudev %s\n",
+           LIBUDEV_VERSION);
+# else
+    printf("  ALSA autodetect:       udev + sysfs\n");
+# endif
+#else
+    printf("  ALSA autodetect:       sysfs only\n");
+#endif
+
+#ifdef HAVE_LAME
+    printf("  MP3 recording (lame):  yes — lame %s\n", get_lame_version());
+#else
+    printf("  MP3 recording (lame):  no\n");
+#endif
+}
+
 /* ── main ────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[])
 {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
+            print_version();
+            return 0;
+        }
+    }
+
     if (argc > 1) radio_dev_path = argv[1];
 
     if (radio_open(&radio, radio_dev_path) < 0) {
