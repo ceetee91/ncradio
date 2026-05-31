@@ -13,7 +13,7 @@ ncradio/
 │                 PipeWire build: both streams via pw_stream + spa_ringbuffer
 │                 ALSA build:    capture + playback via libasound
 ├── audio.h     — Audio struct and public function declarations
-├── eq.c        — 12-band biquad graphic equalizer DSP; compiled only with HAVE_EQ
+├── eq.c        — 11-band biquad graphic equalizer DSP; compiled only with HAVE_EQ
 ├── eq.h        — Eq struct, preset constants, and public function declarations
 ├── record.c    — MP3 encoder wrapper (libmp3lame); compiled only with HAVE_LAME
 ├── record.h    — Record struct and public function declarations
@@ -229,7 +229,7 @@ startup for the ALSA backend), then only read by the UI thread for display
 
 ### `eq.c` / `eq.h`
 
-A self-contained 12-band biquad graphic equalizer, compiled only when
+A self-contained 11-band biquad graphic equalizer, compiled only when
 `HAVE_EQ` is defined.  It has no dependency on any external library (it only
 uses `<math.h>`).
 
@@ -262,7 +262,7 @@ sample_rate — Hz used when computing coefficients
 
 **Key functions:**
 
-- **`eq_init(eq, sample_rate)`** — (re-)computes all 12 bands' coefficients
+- **`eq_init(eq, sample_rate)`** — (re-)computes all 11 bands' coefficients
   from `eq->gains_db[]` for the given rate; clears filter state.  Called once
   from the audio thread after format negotiation (under `eq->lock`).
 
@@ -362,7 +362,7 @@ EqCustomPreset eq_custom[EQ_CUSTOM_MAX]      — up to 16 user-saved named EQ pr
 int      eq_custom_count                     — number of valid entries in eq_custom [HAVE_EQ]
 ```
 
-The `EqCustomPreset` struct holds a 32-byte `name` and a `float gains[12]` array.
+The `EqCustomPreset` struct holds a 32-byte `name` and a `float gains[11]` array.
 
 **File format:**
 
@@ -559,7 +559,7 @@ Row +14  Apply EQ to recs:     Yes              <- -> or Enter toggle  ← HAVE_
 3. **[HAVE_EQ]** Initialise EQ:
    a. `eq_init(&g_eq, 48000.0)` — seeds coefficients at 48 kHz (default before
       audio format negotiation).
-   b. Apply saved per-band gains via `eq_set_gain()` for each of the 12 bands.
+   b. Apply saved per-band gains via `eq_set_gain()` for each of the 11 bands.
    c. Set `g_eq.enabled` from `config.eq_enabled`.
    d. Resolve `config.eq_active_preset` → `eq_preset_idx` by scanning built-in
       names then custom names (linear search); stays −1 if the name is not found.

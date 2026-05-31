@@ -41,7 +41,7 @@ available; ALSA (`libasound`) is the fallback. It writes `config.mk`. Run
 | `--disable-pipewire` | Prefer ALSA even if PipeWire is available |
 | `--disable-udev` | Use sysfs-only device autodetection; do not link libudev |
 | `--disable-lame` | Build without MP3 recording support |
-| `--disable-eq` | Build without the 12-band equalizer (omits `eq.c` and `-lm`) |
+| `--disable-eq` | Build without the 11-band equalizer (omits `eq.c` and `-lm`) |
 
 Optional install to `/usr/local/bin`:
 
@@ -111,7 +111,7 @@ and volume are persisted.
 | `d` | Delete the highlighted preset |
 | `e` | Rename the highlighted preset |
 | `o` | Open settings panel |
-| `E` | Open equalizer panel (12-band EQ; compiled in by default) |
+| `E` | Open equalizer panel (11-band EQ; compiled in by default) |
 | `↑` / `↓` | Move selection down/up within the current preset column |
 | `←` / `→` | Move selection one column left/right in the preset grid |
 | `PgUp` / `PgDn` | Scroll preset list by one visible window of rows |
@@ -180,7 +180,7 @@ The info row shows `- REC 0:00 filename` with a running elapsed time.
 
 ### Equalizer panel (after pressing `E`)
 
-Opens a full-screen 12-band graphic equalizer covering 32 Hz – 20 kHz. A bar
+Opens a full-screen 11-band graphic equalizer covering 32 Hz – 20 kHz. A bar
 graph shows the current curve; the selected band is highlighted.
 
 **Band navigation and gain adjustment:**
@@ -434,7 +434,7 @@ written to `~/.ncradio.conf` on every adjustment.
 
 ## Equalizer
 
-The 12-band graphic equalizer applies a cascade of biquad peaking filters to
+The 11-band graphic equalizer applies a cascade of biquad peaking filters to
 the playback audio path. It has no effect when audio is disabled or when the
 EQ is toggled off.
 
@@ -453,7 +453,6 @@ EQ is toggled off.
 | 9  | 8 kHz   |
 | 10 | 12 kHz  |
 | 11 | 16 kHz  |
-| 12 | 20 kHz  |
 
 Each band has a gain range of −12 dB to +12 dB.
 
@@ -471,7 +470,7 @@ Each band has a gain range of −12 dB to +12 dB.
 ### Custom presets
 
 Custom presets are saved in `~/.ncradio.conf` as
-`eq_preset_<name>=<12 comma-separated gain values>`. Up to 16 custom presets
+`eq_preset_<name>=<11 comma-separated gain values>`. Up to 16 custom presets
 are supported. The name of the last active preset is also saved so the
 displayed name is correct after a restart.
 
@@ -538,8 +537,8 @@ PipeWire, or an ALSA `hw:CARD=<id>,DEV=0` string when built with ALSA.
 | `record_eq_enabled` | `0` or `1` | Apply EQ curve to recordings when EQ is on (default 1) |
 | `eq_enabled` | `0` or `1` | Whether the EQ is active |
 | `eq_active_preset` | name string | Name of the last active preset; empty = unsaved custom curve |
-| `eq_gains` | 12 comma-separated floats | Per-band gain values in dB (−12 … +12) |
-| `eq_preset_<name>` | 12 comma-separated floats | A saved custom EQ preset named `<name>` |
+| `eq_gains` | 11 comma-separated floats | Per-band gain values in dB (−12 … +12) |
+| `eq_preset_<name>` | 11 comma-separated floats | A saved custom EQ preset named `<name>` |
 
 **Station lines** — frequency in MHz, optional name after a space. Lines
 starting with `#` are comments.
