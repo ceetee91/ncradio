@@ -10,7 +10,7 @@ struct Eq;   /* forward declaration; include eq.h if you need the full type */
 typedef struct {
     char         device[AUDIO_DEV_NAMELEN];      /* capture device / PipeWire source node */
     char         play_device[AUDIO_DEV_NAMELEN]; /* playback device / PipeWire sink node; empty = default */
-    unsigned int buffer_frames;  /* period size hint; 0 → use default */
+    unsigned int buffer_frames;  /* ALSA: period size in frames; PipeWire: ring buffer size in KB */
     volatile int running;    /* 1 while thread is alive */
     int          started;    /* pthread_create was called, needs join */
     pthread_t    thread;

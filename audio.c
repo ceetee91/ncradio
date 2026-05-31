@@ -30,8 +30,6 @@
    ═══════════════════════════════════════════════════════════════════════ */
 #ifdef HAVE_PIPEWIRE
 
-#define PW_RING_BYTES (1u << 21)   /* 2 MiB — several seconds of headroom */
-
 /* State shared between the audio thread and PipeWire callbacks. */
 struct pw_full_audio {
     struct pw_thread_loop *loop;
@@ -43,6 +41,7 @@ struct pw_full_audio {
     struct spa_hook        play_listener;
     struct spa_ringbuffer  ring;
     uint8_t               *ring_buf;
+    uint32_t               ring_bytes;      /* ring buffer size; must be a power of 2 */
     uint32_t               stride;          /* bytes per frame, updated on format negotiation */
     int                    play_connected;  /* 1 once play stream is connected */
     char                   errmsg[128];
@@ -123,9 +122,9 @@ static void pw_cap_process(void *data)
     if (size > 0) {
         uint32_t index;
         int32_t filled = spa_ringbuffer_get_write_index(&s->ring, &index);
-        if ((uint32_t)(PW_RING_BYTES - filled) >= size) {
-            spa_ringbuffer_write_data(&s->ring, s->ring_buf, PW_RING_BYTES,
-                                      index & (PW_RING_BYTES - 1),
+        if ((uint32_t)(s->ring_bytes - filled) >= size) {
+            spa_ringbuffer_write_data(&s->ring, s->ring_buf, s->ring_bytes,
+                                      index & (s->ring_bytes - 1),
                                       pcm, size);
             spa_ringbuffer_write_update(&s->ring, (int32_t)(index + size));
         }
@@ -183,8 +182,8 @@ static void pw_play_process(void *data)
         fill = (uint32_t)avail < req ? (uint32_t)avail : req;
 
     if (fill > 0) {
-        spa_ringbuffer_read_data(&s->ring, s->ring_buf, PW_RING_BYTES,
-                                 index & (PW_RING_BYTES - 1),
+        spa_ringbuffer_read_data(&s->ring, s->ring_buf, s->ring_bytes,
+                                 index & (s->ring_bytes - 1),
                                  d->data, fill);
         spa_ringbuffer_read_update(&s->ring, (int32_t)(index + fill));
 #ifdef HAVE_EQ
@@ -222,7 +221,15 @@ static void *audio_fn(void *arg)
     s.stride    = 2 * 2;
     a->channels = 2;
 
-    s.ring_buf = malloc(PW_RING_BYTES);
+    {
+        uint32_t kb = a->buffer_frames > 0 ? a->buffer_frames : 1024;
+        if (kb > 2048) kb = 2048;
+        if (kb < 128)  kb = 128;
+        uint32_t p = 128;
+        while (p * 2 <= kb) p *= 2;
+        s.ring_bytes = p * 1024;
+    }
+    s.ring_buf = malloc(s.ring_bytes);
     if (!s.ring_buf) {
         snprintf(a->errmsg, sizeof(a->errmsg), "out of memory");
         goto done;

@@ -586,8 +586,18 @@ static void draw_settings(void)
                                                  : "(default)");
             break;
         case SETTING_AUDIO_BUFFER:
+#ifdef HAVE_PIPEWIRE
+            if (config.audio_buffer_frames >= 1024 &&
+                config.audio_buffer_frames % 1024 == 0)
+                snprintf(valstr, sizeof(valstr), "%d MB",
+                         config.audio_buffer_frames / 1024);
+            else
+                snprintf(valstr, sizeof(valstr), "%d KB",
+                         config.audio_buffer_frames);
+#else
             snprintf(valstr, sizeof(valstr), "%d frames",
                      config.audio_buffer_frames);
+#endif
             break;
         case SETTING_AUDIO_MUTE_SCAN:
             snprintf(valstr, sizeof(valstr), "%s",
@@ -1220,7 +1230,11 @@ static void handle_settings_key(int ch)
                 config_save(&config);
             }
         } else if (settings_sel == SETTING_AUDIO_BUFFER) {
+#ifdef HAVE_PIPEWIRE
+            static const int bufsizes[] = { 128, 256, 512, 1024, 2048 };
+#else
             static const int bufsizes[] = { 512, 1024, 2048, 4096, 8192 };
+#endif
             static const int nb = 5;
             int idx = 0;
             for (int k = 0; k < nb; k++)

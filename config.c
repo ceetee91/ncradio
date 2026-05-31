@@ -24,8 +24,18 @@ static void settings_defaults(Config *c)
     c->audio_enabled   = c->audio_enabled   ? 1 : 0;
     c->audio_mute_scan = c->audio_mute_scan ? 1 : 0;
     c->audio_mute_seek = c->audio_mute_seek ? 1 : 0;
+#ifdef HAVE_PIPEWIRE
+    {
+        static const int valid[] = {128, 256, 512, 1024, 2048};
+        int ok = 0;
+        for (int i = 0; i < 5; i++)
+            if (c->audio_buffer_frames == valid[i]) { ok = 1; break; }
+        if (!ok) c->audio_buffer_frames = DEFAULT_AUDIO_BUFFER_FRAMES;
+    }
+#else
     if (c->audio_buffer_frames < 256 || c->audio_buffer_frames > 65536)
         c->audio_buffer_frames = DEFAULT_AUDIO_BUFFER_FRAMES;
+#endif
 }
 
 int config_load(Config *c)
