@@ -3,23 +3,9 @@
 A small ncurses FM radio controller for Linux, built for V4L2-compatible tuner
 cards and USB radio sticks accessible as `/dev/radio0`. Includes a live audio
 pipe that routes the tuner's capture output to the system's default playback
-device. Tested with ADS Tech InstantFM Music RDX-155.
+device. Tested on Fedora 44 with ADS Tech InstantFM Music RDX-155.
 
-```
-              ncradio v0.1
-──────────────────────────────────────────────────────────────────
- Freq:  98.50 MHz  [ST]    Signal:[||||||||||....] 71%
- Vol:   [||||||||||||||] 80%  [MUTED] [A]          Capital FM
- Coldplay - The Scientist                               ← RDS radio text
-──────────────────────────────────────────────────────────────────
- Presets (9):
- > 1.  87.90 BBC R1      4.  98.50 Capital  <  7. 105.40
-   2.  91.30 Classic     5. 101.00              8. 107.30
-   3.  94.50 Radio 3     6. 103.60 LBC          9. 107.90
-──────────────────────────────────────────────────────────────────
- s:scan  ,:step-  .:step+  <:seek-  >:seek+  t:tune  m:mute  +/-:vol
- a:add  d:del  e:rename  o:settings  arrows:navigate  Enter:tune  q:quit
-```
+![ncradio screenshot](ncradio.png)
 
 ## Requirements
 
