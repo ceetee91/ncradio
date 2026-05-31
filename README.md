@@ -164,7 +164,6 @@ All tuning, scanning, seeking, mute, and settings keys are blocked while recordi
 | Key | Action |
 |-----|--------|
 | `s` or `Esc` | Stop recording and save file |
-| `q` | Stop recording, save file, and quit |
 
 The info row shows `- REC 0:00 filename` with a running elapsed time.
 
