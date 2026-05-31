@@ -1,11 +1,11 @@
 -include config.mk
 
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -D_POSIX_C_SOURCE=200809L $(AUDIO_CFLAGS)
-LDFLAGS = -lncurses -lpthread $(AUDIO_LIBS)
+CFLAGS  = -Wall -Wextra -O2 -D_POSIX_C_SOURCE=200809L $(AUDIO_CFLAGS) $(EQ_CFLAGS)
+LDFLAGS = -lncurses -lpthread $(EQ_LIBS) $(AUDIO_LIBS)
 
 TARGET  = ncradio
-SRCS    = ncradio.c radio.c config.c rds.c $(AUDIO_SRCS) $(RECORD_SRCS)
+SRCS    = ncradio.c radio.c config.c rds.c $(EQ_SRCS) $(AUDIO_SRCS) $(RECORD_SRCS)
 OBJS    = $(SRCS:.c=.o)
 
 all: $(TARGET)
@@ -16,7 +16,8 @@ $(TARGET): $(OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-ncradio.o: ncradio.c radio.h config.h audio.h
+ncradio.o: ncradio.c radio.h config.h audio.h eq.h
+eq.o:      eq.c      eq.h
 radio.o:   radio.c   radio.h rds.h config.h
 config.o:  config.c  config.h
 rds.o:     rds.c     rds.h

@@ -14,11 +14,15 @@
 #ifdef HAVE_AUDIO
 #include "audio.h"
 #endif
+#ifdef HAVE_EQ
+#include "eq.h"
+#include <math.h>
+#endif
 #ifdef HAVE_LAME
 #include "record.h"
 #endif
 
-#define VERSION "1.0"
+#define VERSION "1.1"
 
 /* Fixed layout rows */
 #define ROW_TITLE  0
@@ -41,6 +45,9 @@
 
 typedef enum {
     M_NORMAL, M_TUNING, M_SCANNING, M_EDITING, M_SETTINGS, M_SEEKING,
+#ifdef HAVE_EQ
+    M_EQ,
+#endif
     M_RECORD_NAME, M_RECORDING
 } Mode;
 
@@ -87,6 +94,18 @@ static int settings_sel = 0;
 #else
 #define SETTING_COUNT           3
 #endif
+
+#ifdef HAVE_EQ
+/* EQ state */
+static Eq    g_eq = { .lock = PTHREAD_MUTEX_INITIALIZER };
+static int   eq_sel_band = 0;     /* currently selected band in M_EQ */
+static int   eq_sel_row  = 0;     /* 0 = band row, 1 = preset row */
+static int   eq_naming   = 0;     /* 1 while typing a custom-preset name */
+static char  eq_name_buf[EQ_CUSTOM_NAMELEN];
+static int   eq_name_len = 0;
+static int   eq_preset_idx = 0;   /* active preset: 0=Flat … EQ_PRESET_COUNT-1=built-in,
+                                      EQ_PRESET_COUNT+n=custom, -1=Custom* (unsaved) */
+#endif /* HAVE_EQ */
 
 #ifdef HAVE_AUDIO
 /* audio state and enumerated capture devices */
@@ -141,8 +160,8 @@ static uint32_t prescan_freqs[MAX_PRESETS];
 static char     prescan_names[MAX_PRESETS][NAME_MAX_LEN + 1];
 
 /* cycle list for scan step (Hz) */
-static const uint32_t scan_steps[] = { 25000, 50000, 100000, 200000 };
-#define SCAN_STEP_COUNT 4
+static const uint32_t scan_steps[] = { 50000, 100000, 200000 };
+#define SCAN_STEP_COUNT 3
 
 /* timed status message */
 static char   status_msg[128];
@@ -267,11 +286,19 @@ static void draw_volume(void)
     }
 #endif
 
+#ifdef HAVE_EQ
+    if (g_eq.enabled) {
+        attron(COLOR_PAIR(CP_VOL) | A_BOLD);
+        mvprintw(ROW_VOL, 46, "[EQ]");
+        attroff(COLOR_PAIR(CP_VOL) | A_BOLD);
+    }
+#endif
+
     /* RDS station name — right-aligned */
     if (radio.rds_capable && radio.rds.ps_ready && radio.rds.ps[0]) {
         int len = (int)strlen(radio.rds.ps);
         int col = COLS - len - 2;
-        if (col > 42) {
+        if (col > 52) {
             attron(COLOR_PAIR(CP_CUR) | A_BOLD);
             mvprintw(ROW_VOL, col, "%s", radio.rds.ps);
             attroff(COLOR_PAIR(CP_CUR) | A_BOLD);
@@ -348,6 +375,130 @@ static void draw_info(void)
 static int list_rows(void) { return LINES - ROW_LIST - 3; }
 
 /* ── settings panel ──────────────────────────────────────────────────── */
+
+#ifdef HAVE_EQ
+
+/* Return the name of the currently active preset (built-in or custom). */
+static const char *eq_preset_name(void)
+{
+    if (eq_preset_idx < 0)
+        return "Custom*";
+    if (eq_preset_idx < EQ_PRESET_COUNT)
+        return EQ_PRESET_NAMES[eq_preset_idx];
+    int ci = eq_preset_idx - EQ_PRESET_COUNT;
+    if (ci < config.eq_custom_count)
+        return config.eq_custom[ci].name;
+    return "Custom*";
+}
+
+static int eq_total_presets(void)
+{
+    return EQ_PRESET_COUNT + config.eq_custom_count;
+}
+
+static void draw_eq(void)
+{
+    int top     = ROW_LIST;
+    int rows    = list_rows();            /* usable rows in the list area */
+    int bar_max = (rows - 5) / 2;        /* rows available for +/- bars */
+    if (bar_max < 1) bar_max = 1;
+    int db_per_row = 12 / bar_max + 1;   /* dB represented by one row */
+
+    /* Column layout: 4 chars per band label, spaced to fit */
+    int band_w    = (COLS - 6) / EQ_BANDS;
+    if (band_w < 3) band_w = 3;
+    int total_w   = band_w * EQ_BANDS;
+    int left_off  = (COLS - total_w - 5) / 2 + 4; /* 4-char y-axis label */
+
+    /* --- Header line (preset selector or name input) --- */
+    move(top, 0); clrtoeol();
+    if (eq_naming) {
+        attron(A_BOLD);
+        mvprintw(top, 2, "Save as: [%.*s_]", EQ_CUSTOM_NAMELEN - 2, eq_name_buf);
+        attroff(A_BOLD);
+        mvprintw(top, COLS - 30, "Enter=confirm  Esc=cancel");
+    } else {
+        mvprintw(top, 2, "Preset: ");
+        int hi = (eq_sel_row == 1);
+        if (hi) attron(COLOR_PAIR(CP_SEL) | A_BOLD);
+        mvprintw(top, 10, "< %-12s >", eq_preset_name());
+        if (hi) attroff(COLOR_PAIR(CP_SEL) | A_BOLD);
+        attron(g_eq.enabled ? (COLOR_PAIR(CP_SIG_HI) | A_BOLD) : A_DIM);
+        mvprintw(top, 28, g_eq.enabled ? " EQ ON " : " EQ OFF");
+        attroff(g_eq.enabled ? (COLOR_PAIR(CP_SIG_HI) | A_BOLD) : A_DIM);
+        /* delete hint for custom presets */
+        if (eq_preset_idx >= EQ_PRESET_COUNT && eq_preset_idx >= 0)
+            mvprintw(top, 37, " [Del] to delete");
+    }
+
+    /* --- Separator --- */
+    move(top + 1, 0); clrtoeol();
+    for (int c = 0; c < COLS; c++) mvaddch(top + 1, c, ACS_HLINE);
+
+    /* --- Bar graph --- */
+    int zero_row = top + 2 + bar_max;  /* screen row for 0 dB */
+
+    /* Clear bar area */
+    for (int r = top + 2; r <= zero_row + bar_max; r++) {
+        move(r, 0); clrtoeol();
+    }
+
+    /* Draw y-axis labels and zero line */
+    for (int r = top + 2; r < zero_row + bar_max + 1; r++) {
+        int db = (zero_row - r) * db_per_row;
+        if (r == zero_row) {
+            mvprintw(r, 0, "  0 ");
+            for (int c = left_off; c < left_off + total_w; c++)
+                mvaddch(r, c, ACS_HLINE);
+        } else if (db % 4 == 0) {
+            mvprintw(r, 0, "%+3d ", db);
+        }
+    }
+
+    /* Draw bars for each band */
+    for (int b = 0; b < EQ_BANDS; b++) {
+        int col = left_off + b * band_w;
+        float g = g_eq.gains_db[b];
+        int cells = (int)(fabs(g) / db_per_row + 0.5f);
+        if (cells > bar_max) cells = bar_max;
+
+        int is_sel = (b == eq_sel_band && eq_sel_row == 0);
+
+        if (is_sel) attron(COLOR_PAIR(CP_SEL) | A_BOLD);
+
+        if (g >= 0) {
+            for (int k = 0; k < cells; k++) {
+                int r = zero_row - 1 - k;
+                if (r >= top + 3)
+                    mvaddch(r, col + band_w / 2, ACS_BLOCK);
+            }
+        } else {
+            for (int k = 0; k < cells; k++) {
+                int r = zero_row + 1 + k;
+                if (r <= zero_row + bar_max)
+                    mvaddch(r, col + band_w / 2, ACS_BLOCK);
+            }
+        }
+
+        /* Gain value under the bar */
+        char gstr[8];
+        if (g == 0.0f)
+            snprintf(gstr, sizeof gstr, "  0 ");
+        else
+            snprintf(gstr, sizeof gstr, "%+.0f", g);
+        if (is_sel) {
+            mvprintw(zero_row + bar_max + 1, col, "%-*s", band_w, gstr);
+        }
+
+        if (is_sel) attroff(COLOR_PAIR(CP_SEL) | A_BOLD);
+
+        /* Frequency label */
+        mvprintw(zero_row + bar_max + 2, col, "%-*s", band_w,
+                 EQ_FREQ_LABELS[b]);
+    }
+}
+
+#endif /* HAVE_EQ */
 
 static void draw_settings(void)
 {
@@ -533,6 +684,9 @@ static void preset_layout(int count,
 static void draw_presets(void)
 {
     if (mode == M_SETTINGS) { draw_settings(); return; }
+#ifdef HAVE_EQ
+    if (mode == M_EQ)       { draw_eq();       return; }
+#endif
 
     int top  = ROW_LIST;
     int rows = list_rows();
@@ -663,9 +817,28 @@ static void draw_help(void)
         mvprintw(y + 1, 2,
                  "Up/Dn:select   Left/Right:adjust   Enter:toggle   Esc/o:done");
         break;
+#ifdef HAVE_EQ
+    case M_EQ:
+        if (eq_naming) {
+            mvprintw(y + 1, 2, "Type name   Enter:save   Esc:cancel   Bksp:delete");
+        } else if (eq_sel_row == 0) {
+            mvprintw(y + 1, 2,
+                     "Left/Right:band   Up/Dn:+/-1dB   PgUp/PgDn:+/-3dB   "
+                     "S:save preset   []:cycle presets   Space:toggle   Esc/E:back");
+        } else {
+            mvprintw(y + 1, 2,
+                     "Left/Right:cycle presets   Tab/Enter:edit bands   "
+                     "S:save preset   Del:delete   Space:toggle   Esc/E:back");
+        }
+        break;
+#endif
     case M_NORMAL:
         mvprintw(y + 1, 2,
+#ifdef HAVE_EQ
+                 "s:scan  ,:step-  .:step+  <:seek-  >:seek+  t:tune  m:mute  +/-:vol  E:equalizer");
+#else
                  "s:scan  ,:step-  .:step+  <:seek-  >:seek+  t:tune  m:mute  +/-:vol");
+#endif
         mvprintw(y + 2, 2,
 #ifdef HAVE_LAME
                  "a:add  d:del  e:rename  r:record  o:settings  arrows:navigate  Enter:tune  q:quit"
@@ -753,6 +926,243 @@ static void finish_scan(void)
 }
 
 /* ── input ───────────────────────────────────────────────────────────── */
+
+#ifdef HAVE_EQ
+
+/* Apply eq_preset_idx choice to g_eq; if idx points to a built-in preset,
+   loads those gains; if custom, loads the stored gains. */
+static void eq_apply_preset(int idx)
+{
+    if (idx < 0) return;
+    if (idx < EQ_PRESET_COUNT) {
+        eq_load_preset(&g_eq, idx);
+    } else {
+        int ci = idx - EQ_PRESET_COUNT;
+        if (ci < config.eq_custom_count) {
+            pthread_mutex_lock(&g_eq.lock);
+            for (int i = 0; i < EQ_BANDS; i++) {
+                g_eq.gains_db[i] = config.eq_custom[ci].gains[i];
+                /* recompute inline since we hold the lock */
+            }
+            pthread_mutex_unlock(&g_eq.lock);
+            /* Now recompute all bands via public API (acquires lock each time) */
+            for (int i = 0; i < EQ_BANDS; i++)
+                eq_set_gain(&g_eq, i, config.eq_custom[ci].gains[i]);
+        }
+    }
+    memcpy(config.eq_gains, g_eq.gains_db, sizeof(config.eq_gains));
+    /* Persist the name so it survives restart */
+    const char *pname;
+    if (idx < EQ_PRESET_COUNT) {
+        pname = EQ_PRESET_NAMES[idx];
+    } else {
+        int ci = idx - EQ_PRESET_COUNT;
+        pname = (ci < config.eq_custom_count) ? config.eq_custom[ci].name : "";
+    }
+    strncpy(config.eq_active_preset, pname, EQ_CUSTOM_NAMELEN - 1);
+    config.eq_active_preset[EQ_CUSTOM_NAMELEN - 1] = '\0';
+    config_save(&config);
+}
+
+static int eq_delete_in_progress = 0; /* require double-Del to confirm */
+
+static void handle_eq_key(int ch)
+{
+    /* --- Naming sub-mode --- */
+    if (eq_naming) {
+        if (ch == 27 || ch == 'E') {            /* Esc / E: cancel */
+            eq_naming = 0;
+            eq_name_len = 0;
+            eq_name_buf[0] = '\0';
+        } else if (ch == '\n' || ch == KEY_ENTER) {  /* Enter: save */
+            if (eq_name_len > 0) {
+                eq_name_buf[eq_name_len] = '\0';
+                int ni = config_eq_preset_add(&config, eq_name_buf, g_eq.gains_db);
+                if (ni >= 0) {
+                    eq_preset_idx = EQ_PRESET_COUNT + ni;
+                    strncpy(config.eq_active_preset, eq_name_buf, EQ_CUSTOM_NAMELEN - 1);
+                    config.eq_active_preset[EQ_CUSTOM_NAMELEN - 1] = '\0';
+                    config_save(&config);
+                }
+            }
+            eq_naming = 0;
+            eq_name_len = 0;
+            eq_name_buf[0] = '\0';
+        } else if ((ch == KEY_BACKSPACE || ch == 127) && eq_name_len > 0) {
+            eq_name_buf[--eq_name_len] = '\0';
+        } else if (ch >= 0x20 && ch < 0x7f && eq_name_len < EQ_CUSTOM_NAMELEN - 1) {
+            /* Disallow '=' and whitespace in preset names (config key constraint) */
+            if (ch != '=' && ch != ' ' && ch != '\t') {
+                eq_name_buf[eq_name_len++] = (char)ch;
+                eq_name_buf[eq_name_len]   = '\0';
+            }
+        }
+        return;
+    }
+
+    eq_delete_in_progress = (ch == KEY_DC) ? eq_delete_in_progress : 0;
+
+    /* --- Normal EQ panel input --- */
+    switch (ch) {
+
+    case 27:                   /* Esc */
+    case 'E':
+        mode = M_NORMAL;
+        break;
+
+    case ' ':                  /* toggle EQ on/off */
+        g_eq.enabled ^= 1;
+        config.eq_enabled = g_eq.enabled;
+        config_save(&config);
+        break;
+
+    case '\t':                 /* Tab: switch between preset row and band row */
+    case KEY_BTAB:
+        eq_sel_row ^= 1;
+        break;
+
+    /* ---- Band row controls ---- */
+    case KEY_LEFT:
+        if (eq_sel_row == 0) {
+            if (eq_sel_band > 0) eq_sel_band--;
+        } else {
+            /* cycle presets backwards */
+            int tot = eq_total_presets();
+            if (tot > 0) {
+                eq_preset_idx = (eq_preset_idx <= 0) ? tot - 1 : eq_preset_idx - 1;
+                eq_apply_preset(eq_preset_idx);
+            }
+        }
+        break;
+
+    case KEY_RIGHT:
+        if (eq_sel_row == 0) {
+            if (eq_sel_band < EQ_BANDS - 1) eq_sel_band++;
+        } else {
+            int tot = eq_total_presets();
+            if (tot > 0) {
+                eq_preset_idx = (eq_preset_idx + 1) % tot;
+                eq_apply_preset(eq_preset_idx);
+            }
+        }
+        break;
+
+    case KEY_UP:
+        if (eq_sel_row == 0) {
+            float g = g_eq.gains_db[eq_sel_band] + 1.0f;
+            if (g > 12.0f) g = 12.0f;
+            eq_set_gain(&g_eq, eq_sel_band, g);
+            config.eq_gains[eq_sel_band] = g;
+            eq_preset_idx = -1;
+            config.eq_active_preset[0] = '\0';
+            config_save(&config);
+        } else {
+            eq_sel_row = 0;      /* move to bands row */
+        }
+        break;
+
+    case KEY_DOWN:
+        if (eq_sel_row == 0) {
+            float g = g_eq.gains_db[eq_sel_band] - 1.0f;
+            if (g < -12.0f) g = -12.0f;
+            eq_set_gain(&g_eq, eq_sel_band, g);
+            config.eq_gains[eq_sel_band] = g;
+            eq_preset_idx = -1;
+            config.eq_active_preset[0] = '\0';
+            config_save(&config);
+        } else {
+            eq_sel_row = 0;
+        }
+        break;
+
+    case KEY_PPAGE:            /* PgUp: +3 dB */
+        if (eq_sel_row == 0) {
+            float g = g_eq.gains_db[eq_sel_band] + 3.0f;
+            if (g > 12.0f) g = 12.0f;
+            eq_set_gain(&g_eq, eq_sel_band, g);
+            config.eq_gains[eq_sel_band] = g;
+            eq_preset_idx = -1;
+            config.eq_active_preset[0] = '\0';
+            config_save(&config);
+        }
+        break;
+
+    case KEY_NPAGE:            /* PgDn: -3 dB */
+        if (eq_sel_row == 0) {
+            float g = g_eq.gains_db[eq_sel_band] - 3.0f;
+            if (g < -12.0f) g = -12.0f;
+            eq_set_gain(&g_eq, eq_sel_band, g);
+            config.eq_gains[eq_sel_band] = g;
+            eq_preset_idx = -1;
+            config.eq_active_preset[0] = '\0';
+            config_save(&config);
+        }
+        break;
+
+    case '[':                  /* cycle presets backward */
+    {
+        int tot = eq_total_presets();
+        if (tot > 0) {
+            int cur = (eq_preset_idx < 0) ? 0 : eq_preset_idx;
+            eq_preset_idx = (cur == 0) ? tot - 1 : cur - 1;
+            eq_apply_preset(eq_preset_idx);
+        }
+        break;
+    }
+    case ']':                  /* cycle presets forward */
+    {
+        int tot = eq_total_presets();
+        if (tot > 0) {
+            int cur = (eq_preset_idx < 0) ? 0 : eq_preset_idx;
+            eq_preset_idx = (cur + 1) % tot;
+            eq_apply_preset(eq_preset_idx);
+        }
+        break;
+    }
+
+    case 'S':                  /* save current gains as new custom preset */
+    case 's':
+        eq_naming = 1;
+        eq_name_len = 0;
+        eq_name_buf[0] = '\0';
+        break;
+
+    case 'R':                  /* reset selected band to 0 */
+    case 'r':
+        if (eq_sel_row == 0) {
+            eq_set_gain(&g_eq, eq_sel_band, 0.0f);
+            config.eq_gains[eq_sel_band] = 0.0f;
+            eq_preset_idx = -1;
+            config.eq_active_preset[0] = '\0';
+            config_save(&config);
+        }
+        break;
+
+    case '0':                  /* load Flat preset */
+        eq_preset_idx = 0;
+        eq_apply_preset(0);    /* also saves name and config */
+        break;
+
+    case KEY_DC:               /* Delete: remove custom preset (double-press) */
+        if (eq_preset_idx >= EQ_PRESET_COUNT) {
+            if (eq_delete_in_progress) {
+                int ci = eq_preset_idx - EQ_PRESET_COUNT;
+                config_eq_preset_del(&config, ci);
+                eq_preset_idx = 0;
+                eq_apply_preset(0);   /* also writes name "Flat" and saves */
+                eq_delete_in_progress = 0;
+            } else {
+                eq_delete_in_progress = 1; /* arm; next Del confirms */
+            }
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+#endif /* HAVE_EQ */
 
 static void handle_settings_key(int ch)
 {
@@ -891,6 +1301,12 @@ static void handle_key(int ch)
     case M_SETTINGS:
         handle_settings_key(ch);
         break;
+
+#ifdef HAVE_EQ
+    case M_EQ:
+        handle_eq_key(ch);
+        break;
+#endif
 
     case M_TUNING:
         if (ch == '\n' || ch == KEY_ENTER) {
@@ -1097,6 +1513,16 @@ static void handle_key(int ch)
             settings_sel = 0;
             break;
 
+#ifdef HAVE_EQ
+        case 'E':
+            mode = M_EQ;
+            eq_sel_band = 0;
+            eq_sel_row  = 0;
+            eq_naming   = 0;
+            eq_delete_in_progress = 0;
+            break;
+#endif
+
 #ifdef HAVE_LAME
         case 'r':
             if (!audio.running) {
@@ -1243,6 +1669,30 @@ int main(int argc, char *argv[])
     }
 
     config_load(&config);
+
+#ifdef HAVE_EQ
+    /* Initialise EQ from saved state */
+    eq_init(&g_eq, 48000.0);   /* default rate; reinit when audio starts */
+    for (int i = 0; i < EQ_BANDS; i++)
+        eq_set_gain(&g_eq, i, config.eq_gains[i]);
+    g_eq.enabled = config.eq_enabled;
+
+    /* Restore the active preset name → index */
+    eq_preset_idx = -1;   /* default: unsaved / Custom* */
+    if (config.eq_active_preset[0]) {
+        for (int i = 0; i < EQ_PRESET_COUNT && eq_preset_idx < 0; i++)
+            if (strcmp(EQ_PRESET_NAMES[i], config.eq_active_preset) == 0)
+                eq_preset_idx = i;
+        for (int i = 0; i < config.eq_custom_count && eq_preset_idx < 0; i++)
+            if (strcmp(config.eq_custom[i].name, config.eq_active_preset) == 0)
+                eq_preset_idx = EQ_PRESET_COUNT + i;
+    }
+
+#ifdef HAVE_AUDIO
+    audio.eq = &g_eq;
+#endif
+#endif /* HAVE_EQ */
+
     if (config.volume > 0)
         radio_set_volume(&radio, config.volume);
     if (config.last_freq_hz >= radio.freq_min_hz &&

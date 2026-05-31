@@ -1,7 +1,10 @@
 #pragma once
 #include <stdint.h>
 
-#define MAX_PRESETS   64
+#define MAX_PRESETS      64
+#define EQ_BANDS         11
+#define EQ_CUSTOM_MAX    16
+#define EQ_CUSTOM_NAMELEN 32
 #define NAME_MAX_LEN  32
 #define CONFIG_FILE   "/.ncradio.conf"
 
@@ -48,6 +51,18 @@ typedef struct {
     int      record_bitrate;    /* kbps: 64/96/128/192/256/320 */
     int      record_stereo;     /* 1=stereo 0=mono */
     int      record_samplerate; /* Hz: 22050/44100/48000 */
+
+    /* Equalizer settings */
+    int      eq_enabled;
+    float    eq_gains[EQ_BANDS];
+    char     eq_active_preset[EQ_CUSTOM_NAMELEN]; /* name of active preset; "" = unsaved */
+
+    /* User-saved EQ presets */
+    struct {
+        char  name[EQ_CUSTOM_NAMELEN];
+        float gains[EQ_BANDS];
+    }        eq_custom[EQ_CUSTOM_MAX];
+    int      eq_custom_count;
 } Config;
 
 int  config_load(Config *c);
@@ -55,3 +70,5 @@ int  config_save(const Config *c);
 void config_add(Config *c, uint32_t hz, const char *name);
 void config_del(Config *c, int idx);
 int  config_find(const Config *c, uint32_t hz);
+int  config_eq_preset_add(Config *c, const char *name, const float gains[EQ_BANDS]);
+void config_eq_preset_del(Config *c, int idx);

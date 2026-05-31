@@ -13,6 +13,8 @@ ncradio/
 │                 PipeWire build: both streams via pw_stream + spa_ringbuffer
 │                 ALSA build:    capture + playback via libasound
 ├── audio.h     — Audio struct and public function declarations
+├── eq.c        — 12-band biquad graphic equalizer DSP; compiled only with HAVE_EQ
+├── eq.h        — Eq struct, preset constants, and public function declarations
 ├── record.c    — MP3 encoder wrapper (libmp3lame); compiled only with HAVE_LAME
 ├── record.h    — Record struct and public function declarations
 ├── config.c    — ~/.ncradio.conf read/write
@@ -73,6 +75,7 @@ thread        — pthread handle
 rate          — detected/fixed sample rate, set by thread at startup
 channels      — detected/fixed channel count, set by thread at startup
 errmsg[]      — last error string; empty while running normally
+eq            — pointer to the Eq instance; NULL or HAVE_EQ not set → no EQ
 rec_lock      — mutex protecting rec_fn and rec_ctx
 rec_fn        — recording callback; called after each captured period
 rec_ctx       — opaque pointer passed to rec_fn
@@ -101,14 +104,15 @@ negotiated, using the same rate, limiting total resampling to at most one hop
 
 ```
 [radio card] ─PipeWire graph─▶ pw_cap_process callback
-                                    │
+                                    │  (raw PCM → ring buffer; calls rec_fn)
                                     ├─▶ spa_ringbuffer (2 MiB, lock-free)
                                     │        │
                                     │        ▼
-                                    │   pw_play_process callback ──▶ [speakers]
+                                    │   pw_play_process callback
+                                    │       └─▶ eq_process() [HAVE_EQ] ──▶ [speakers]
                                     │
                                     └─▶ rec_fn(rec_ctx, pcm, frames, channels)
-                                              (inside rec_lock)
+                                              (inside rec_lock; pre-EQ audio)
 ```
 
 **Ring buffer usage** — `spa_ringbuffer_get_write_index` / `spa_ringbuffer_get_read_index`
@@ -164,10 +168,11 @@ absent.
 ```
 while a->running:
     snd_pcm_readi(cap, buf, period)   — blocks ~100 ms per period
+    if a->eq: eq_process(a->eq, buf, n, channels)  [HAVE_EQ]
     snd_pcm_writei(play, buf, n)
     snd_pcm_recover on xrun in either direction
     lock(rec_lock)
-    if rec_fn: rec_fn(rec_ctx, buf, n, channels)
+    if rec_fn: rec_fn(rec_ctx, buf, n, channels)   — post-EQ audio
     unlock(rec_lock)
 ```
 
@@ -212,6 +217,74 @@ by the audio thread (in `pw_cap_param_changed` for the PipeWire backend; during
 startup for the ALSA backend), then only read by the UI thread for display
 (benign race on int-sized fields). `rec_fn` and `rec_ctx` are protected by
 `rec_lock` (a `pthread_mutex_t` initialized in `audio_start`).
+
+### `eq.c` / `eq.h`
+
+A self-contained 12-band biquad graphic equalizer, compiled only when
+`HAVE_EQ` is defined.  It has no dependency on any external library (it only
+uses `<math.h>`).
+
+**Band frequencies** — fixed, 1-octave spacing:
+32 Hz, 64 Hz, 125 Hz, 250 Hz, 500 Hz, 1 kHz, 2 kHz, 4 kHz, 8 kHz, 12 kHz,
+16 kHz, 20 kHz.
+
+**Filter design** — each band is a biquad peaking (bell) filter using the
+bilinear-transform form from the Audio EQ Cookbook (R. Bristow-Johnson).
+Q = √2 ≈ 1.414 is applied uniformly, giving approximately 1-octave bandwidth
+per band.  Coefficients are recomputed whenever a band's gain changes.
+
+**`EqBand` struct:**
+
+```
+b0, b1, b2, a1, a2  — normalised biquad coefficients (a0 = 1)
+x1[2], x2[2]        — input  history (one slot per channel)
+y1[2], y2[2]        — output history (one slot per channel)
+```
+
+**`Eq` struct:**
+
+```
+lock        — mutex; held during eq_set_gain() and eq_process()
+enabled     — 0 = bypass; eq_process() returns immediately
+gains_db[]  — current gain in dB per band, −12 … +12
+bands[]     — EqBand array (coefficients + per-channel state)
+sample_rate — Hz used when computing coefficients
+```
+
+**Key functions:**
+
+- **`eq_init(eq, sample_rate)`** — (re-)computes all 12 bands' coefficients
+  from `eq->gains_db[]` for the given rate; clears filter state.  Called once
+  from the audio thread after format negotiation (under `eq->lock`).
+
+- **`eq_set_gain(eq, band, gain_db)`** — acquires `eq->lock`, stores the new
+  gain, recomputes that band's coefficients.  Clears only that band's delay
+  state.  Safe to call from the UI thread while the audio thread is running.
+
+- **`eq_load_preset(eq, preset_idx)`** — copies all 12 gains from the named
+  built-in preset then calls `compute_band` for each under the lock.
+
+- **`eq_process(eq, buf, frames, channels)`** — processes `frames * channels`
+  interleaved S16_LE samples in-place.  Holds `eq->lock` for the duration of
+  the call (typically a few hundred microseconds).  Converts S16 → float,
+  chains all 12 Direct-Form-I biquads, clamps, and converts back.
+
+**Thread safety:** The mutex is sufficient because the audio thread calls
+`eq_process` at realtime priority but the UI thread calls `eq_set_gain`
+infrequently; contention in practice is zero.
+
+**Built-in presets** (index, name, character):
+
+| # | Name | Character |
+|---|------|-----------|
+| 0 | Flat | All 0 dB |
+| 1 | Rock | V-curve: bass boost, scooped mids, bright highs |
+| 2 | Pop | Forward mids for vocal presence |
+| 3 | Classical | Warm and airy, gentle presence rolloff |
+| 4 | Jazz | Rich low-mids, smooth top end |
+| 5 | Electronic | Heavy sub-bass and high sparkle |
+
+---
 
 ### `record.c` / `record.h`
 
@@ -272,7 +345,14 @@ int      audio_mute_seek                     — 1 = stop audio pipe while seeki
 int      record_bitrate                      — MP3 bitrate kbps (64/96/128/192/256/320)
 int      record_stereo                       — 1 = stereo output, 0 = mono
 int      record_samplerate                   — output sample rate Hz (22050/44100/48000)
+int      eq_enabled                          — 1 = EQ active at startup [HAVE_EQ]
+float    eq_gains[EQ_BANDS]                  — per-band gain in dB, −12…+12 [HAVE_EQ]
+char     eq_active_preset[EQ_CUSTOM_NAMELEN] — name of active preset; "" = unsaved [HAVE_EQ]
+EqCustomPreset eq_custom[EQ_CUSTOM_MAX]      — up to 16 user-saved named EQ presets [HAVE_EQ]
+int      eq_custom_count                     — number of valid entries in eq_custom [HAVE_EQ]
 ```
+
+The `EqCustomPreset` struct holds a 32-byte `name` and a `float gains[12]` array.
 
 **File format:**
 
@@ -290,15 +370,24 @@ audio_mute_seek=1
 record_bitrate=128
 record_stereo=1
 record_samplerate=44100
+eq_enabled=1
+eq_active_preset=Rock
+eq_gains=4.0,3.0,2.0,0.0,-1.0,-2.0,-1.0,0.0,2.0,3.0,3.0,2.0
+eq_preset_MyBass=6.0,5.0,4.0,2.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
 # stations
 87.90 BBC Radio 1        ← float [optional name]
 98.50
 ```
 
+The `eq_preset_<name>` key form is parsed by checking `strncmp(key, "eq_preset_", 10)`;
+the suffix (up to `EQ_CUSTOM_NAMELEN-1` bytes) becomes the preset name.
+The key buffer was widened to 64 bytes and value buffer to 192 bytes to accommodate
+the longest gains string (~72 chars) plus a preset name prefix.
+
 Lines are categorised at load time:
 - `#` or blank → skip
 - contains `=` and first char is not a digit → settings `key=value`
-  (parsed with `%39[^=]=%79[^\n]`; `atoi` applied for integer fields)
+  (parsed with `%63[^=]=%191[^\n]`; `atoi` applied for integer fields)
 - parseable as a float in 87.5–108.0 → station (remainder of line is the name)
 
 Defaults are seeded before reading so the struct is always valid even when the
@@ -306,8 +395,8 @@ file is absent or has no settings lines. After parsing, `settings_defaults()`
 clamps numeric values to their valid ranges.
 
 `config_save()` always writes settings before stations. The format is
-backward-compatible: old ncradio versions skip `key=value` lines because
-`sscanf("%lf", "scan_step=…")` fails to match.
+backward-compatible: old ncradio versions skip `key=value` lines they don't
+recognise, including all `eq_*` keys.
 
 ### `radio.c` / `radio.h`
 
@@ -388,6 +477,7 @@ M_SCANNING    — scan thread running
 M_EDITING     — user renaming a preset after 'e'
 M_SETTINGS    — settings panel open after 'o'
 M_SEEKING     — seek thread running
+M_EQ          — equalizer panel open after 'E'  (HAVE_EQ only)
 M_RECORD_NAME — user typing a recording filename after 'r' (HAVE_LAME only)
 M_RECORDING   — MP3 recording in progress (HAVE_LAME only)
 ```
@@ -398,20 +488,21 @@ M_RECORDING   — MP3 recording in progress (HAVE_LAME only)
 Row 0          title bar
 Row 1          horizontal separator
 Row 2          frequency  [ST/MO]  signal bar
-Row 3          volume bar  [MUTED]  [A]/[A!]  RDS PS name (right-aligned)
+Row 3          volume bar  [MUTED]  [A]/[A!]  [EQ]  RDS PS name (right-aligned)
 Row 4          mode info line:
-                 M_NORMAL/M_SETTINGS  — timed status message, then RDS RT
-                 M_TUNING             — "Tune (MHz): ___"
-                 M_EDITING            — "Name: ___"
-                 M_SCANNING           — scan progress bar
-                 M_SEEKING            — "Seeking forward >" / "Seeking backward <"
-                 M_RECORD_NAME        — "Record file: ___"
-                 M_RECORDING          — "- REC 0:00  filename" (red, elapsed time)
+                 M_NORMAL/M_SETTINGS/M_EQ — timed status message, then RDS RT
+                 M_TUNING                 — "Tune (MHz): ___"
+                 M_EDITING                — "Name: ___"
+                 M_SCANNING               — scan progress bar
+                 M_SEEKING                — "Seeking forward >" / "Seeking backward <"
+                 M_RECORD_NAME            — "Record file: ___"
+                 M_RECORDING              — "- REC 0:00  filename" (red, elapsed time)
 Row 5          horizontal separator
 Rows 6…LINES-4 list area:
                  M_NORMAL/M_TUNING/M_EDITING/M_SEEKING — preset grid
                  M_SCANNING                            — found-stations list
                  M_SETTINGS                            — settings panel
+                 M_EQ                                  — equalizer panel (HAVE_EQ)
 LINES-3        horizontal separator
 LINES-2        help line (context-sensitive)
 LINES-1        second help line (M_NORMAL only)
@@ -420,6 +511,7 @@ LINES-1        second help line (M_NORMAL only)
 **Audio indicator** (row 3):
 - `[A]` green — audio pipe is running
 - `[A!]` red — pipe stopped with an error (error text visible in settings panel)
+- `[EQ]` — EQ is enabled (HAVE_EQ only)
 - absent — audio disabled in config
 
 **Settings panel** (`draw_settings()`) — ten rows when only audio is compiled
@@ -452,14 +544,24 @@ Row +13  Record sample rate:   44100 Hz         <- -> to cycle        ← HAVE_L
 
 1. `radio_open` — opens the V4L2 device, reads tunable range and capabilities.
 2. `config_load` — reads `~/.ncradio.conf`; applies defaults for missing keys.
-3. Restore volume: if `config.volume > 0`, call `radio_set_volume`.
-4. Restore frequency: if `config.last_freq_hz` is within the device's reported
+3. **[HAVE_EQ]** Initialise EQ:
+   a. `eq_init(&g_eq, 48000.0)` — seeds coefficients at 48 kHz (default before
+      audio format negotiation).
+   b. Apply saved per-band gains via `eq_set_gain()` for each of the 12 bands.
+   c. Set `g_eq.enabled` from `config.eq_enabled`.
+   d. Resolve `config.eq_active_preset` → `eq_preset_idx` by scanning built-in
+      names then custom names (linear search); stays −1 if the name is not found.
+   e. Set `audio.eq = &g_eq` so the audio thread picks it up at start.
+4. Restore volume: if `config.volume > 0`, call `radio_set_volume`.
+5. Restore frequency: if `config.last_freq_hz` is within the device's reported
    range, call `radio_set_freq`.
-5. Enumerate audio capture and playback devices for the settings panel.
-6. Auto-enable audio: if `audio_enabled == 0` and `audio_device` is empty
+6. Enumerate audio capture and playback devices for the settings panel.
+7. Auto-enable audio: if `audio_enabled == 0` and `audio_device` is empty
    (i.e. no explicit prior choice), call `audio_autodetect`. If a device is
    found, set `audio_enabled = 1`, save both fields, and proceed.
-7. `audio_apply` — start the pipe if enabled.
+8. `audio_apply` — start the pipe if enabled.  The audio thread calls
+   `eq_init(a->eq, actual_rate)` once the sample rate is negotiated, replacing
+   the 48 kHz seed with accurate coefficients.
 
 **Recording** (`M_RECORD_NAME` / `M_RECORDING`, HAVE_LAME only):
 
@@ -543,14 +645,14 @@ race).
     │                        ├─ pw_stream (capture) ←── radio Audio/Source node
     │                        │        └─ pw_cap_process: PCM → ring buffer + rec_fn
     │                        └─ pw_stream (playback) ───▶ speaker Audio/Sink node
-    │                                 └─ pw_play_process: ring buffer → PCM
+    │                                 └─ pw_play_process: ring buffer → eq_process [HAVE_EQ] → PCM
     │
     │  [ALSA build]
     │       audio_fn loop:
     │                   ├─ snd_pcm_open(hw:CARD=x,DEV=0, CAPTURE)
     │                   ├─ probe rate, configure S16_LE
     │                   ├─ snd_pcm_open("default", PLAYBACK)
-    │                   └─ snd_pcm_readi → snd_pcm_writei → rec_fn(rec_ctx) loop
+    │                   └─ snd_pcm_readi → eq_process [HAVE_EQ] → snd_pcm_writei → rec_fn(rec_ctx) loop
     │
     ├─ record_open → audio.rec_fn/rec_ctx set ← r key (HAVE_LAME)
     │       └─ lame_init → lame_init_params → fopen(path)
@@ -578,14 +680,17 @@ race).
 `configure` probes for `libpipewire-0.3` first (preferred backend), then falls
 back to `libasound` if PipeWire is absent or `--disable-pipewire` is passed. It
 also probes for `libudev` (device autodetection) and `libmp3lame` (recording)
-independently of the audio backend. It writes `config.mk` with `AUDIO_CFLAGS`,
-`AUDIO_SRCS`, `AUDIO_LIBS`, and `RECORD_SRCS`.
+independently of the audio backend. The EQ feature requires no external library
+and is enabled by default. `configure` writes `config.mk` with `AUDIO_CFLAGS`,
+`AUDIO_SRCS`, `AUDIO_LIBS`, `RECORD_SRCS`, `EQ_CFLAGS`, `EQ_LIBS`, and
+`EQ_SRCS`.
 
 | Flag | Effect |
 |------|--------|
 | `--disable-pipewire` | Skip PipeWire probe; use ALSA |
 | `--disable-udev` | Skip libudev probe; sysfs-only autodetection |
 | `--disable-lame` | Skip libmp3lame probe; no recording support |
+| `--disable-eq` | Omit the equalizer; do not compile `eq.c` or link `-lm` |
 
 With PipeWire: `HAVE_PIPEWIRE` is defined, `-lpipewire-0.3` is linked, no
 `-lasound`.
@@ -599,6 +704,10 @@ When lame is found, `HAVE_LAME` is added to `AUDIO_CFLAGS`, `-lmp3lame` to
 When udev is found, `configure` runs `pkg-config --modversion libudev` and, if
 successful, appends `-DLIBUDEV_VERSION=\"<ver>\"` to `AUDIO_CFLAGS` (the only
 component with no runtime version query API).
+
+When EQ is enabled (default): `HAVE_EQ` is added to `EQ_CFLAGS`, `-lm` to
+`EQ_LIBS`, and `eq.c` to `EQ_SRCS`. When `--disable-eq` is given all three
+variables are empty.
 
 Compiled with `-Wall -Wextra -O2 -D_POSIX_C_SOURCE=200809L`. Linked against
 `-lncurses -lpthread` plus the detected audio and optional libraries.

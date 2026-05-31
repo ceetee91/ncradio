@@ -1,6 +1,8 @@
 #pragma once
 #include <pthread.h>
 
+struct Eq;   /* forward declaration; include eq.h if you need the full type */
+
 #define AUDIO_DEV_MAX      32
 #define AUDIO_DEV_NAMELEN  64   /* device/node name */
 #define AUDIO_DEV_DESCLEN  128  /* human-readable description */
@@ -15,6 +17,9 @@ typedef struct {
     unsigned int rate;       /* detected sample rate (set by thread) */
     int          channels;   /* detected channel count (set by thread) */
     char         errmsg[128];/* last error; empty if none */
+
+    /* Equalizer — applied in the playback path when non-NULL. */
+    struct Eq   *eq;
 
     /* Recording hook — protected by rec_lock.
        The audio thread calls rec_fn(rec_ctx, pcm, frames, channels) after

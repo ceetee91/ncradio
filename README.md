@@ -41,6 +41,7 @@ available; ALSA (`libasound`) is the fallback. It writes `config.mk`. Run
 | `--disable-pipewire` | Prefer ALSA even if PipeWire is available |
 | `--disable-udev` | Use sysfs-only device autodetection; do not link libudev |
 | `--disable-lame` | Build without MP3 recording support |
+| `--disable-eq` | Build without the 12-band equalizer (omits `eq.c` and `-lm`) |
 
 Optional install to `/usr/local/bin`:
 
@@ -110,6 +111,7 @@ and volume are persisted.
 | `d` | Delete the highlighted preset |
 | `e` | Rename the highlighted preset |
 | `o` | Open settings panel |
+| `E` | Open equalizer panel (12-band EQ; compiled in by default) |
 | `↑` / `↓` | Move selection down/up within the current preset column |
 | `←` / `→` | Move selection one column left/right in the preset grid |
 | `PgUp` / `PgDn` | Scroll preset list by one visible window of rows |
@@ -176,6 +178,41 @@ The info row shows `- REC 0:00 filename` with a running elapsed time.
 | `Enter` | Toggle boolean settings |
 | `Esc` or `o` | Close settings |
 
+### Equalizer panel (after pressing `E`)
+
+Opens a full-screen 12-band graphic equalizer covering 32 Hz – 20 kHz. A bar
+graph shows the current curve; the selected band is highlighted.
+
+**Band navigation and gain adjustment:**
+
+| Key | Action |
+|-----|--------|
+| `←` / `→` | Move selection left / right across bands |
+| `↑` / `↓` | Adjust selected band ±1 dB |
+| `PgUp` / `PgDn` | Adjust selected band ±3 dB |
+| `R` | Reset selected band to 0 dB |
+| `0` | Load the **Flat** preset (all bands 0 dB) |
+
+**Preset management:**
+
+| Key | Action |
+|-----|--------|
+| `[` / `]` | Cycle through presets (built-in and custom) |
+| `S` | Save current gains as a new named custom preset |
+| `Del` `Del` | Delete the active custom preset (press twice to confirm) |
+
+**Panel controls:**
+
+| Key | Action |
+|-----|--------|
+| `Space` | Toggle EQ on / off (`[EQ]` indicator on volume row) |
+| `Esc` or `E` | Close EQ panel |
+
+**Built-in presets:** Flat, Rock, Pop, Classical, Jazz, Electronic.
+
+Custom presets are saved to `~/.ncradio.conf` and survive restarts, as does the
+name of the last active preset.
+
 ## Status display
 
 ### Stereo / mono
@@ -202,6 +239,7 @@ preset selection). On hardware without RDS support these areas stay blank.
 `[A]` (green) appears on the volume row while the audio pipe is running.
 `[A!]` (red) appears if the pipe stopped due to an error; the error text
 is shown in the settings panel next to the **Audio output** row.
+`[EQ]` appears when the equalizer is enabled.
 
 ## Stepping, scanning, and seeking
 
@@ -386,6 +424,56 @@ written to `~/.ncradio.conf` on every adjustment.
 | Record channels | Stereo | Stereo / Mono | Output channels for recordings |
 | Record sample rate | 44100 Hz | 22050 / 44100 / 48000 Hz | Output sample rate for recordings |
 
+## Equalizer
+
+The 12-band graphic equalizer applies a cascade of biquad peaking filters to
+the playback audio path. It has no effect when audio is disabled or when the
+EQ is toggled off.
+
+### Band layout
+
+| Band | Center frequency |
+|------|-----------------|
+| 1  | 32 Hz   |
+| 2  | 64 Hz   |
+| 3  | 125 Hz  |
+| 4  | 250 Hz  |
+| 5  | 500 Hz  |
+| 6  | 1 kHz   |
+| 7  | 2 kHz   |
+| 8  | 4 kHz   |
+| 9  | 8 kHz   |
+| 10 | 12 kHz  |
+| 11 | 16 kHz  |
+| 12 | 20 kHz  |
+
+Each band has a gain range of −12 dB to +12 dB.
+
+### Built-in presets
+
+| Preset | Character |
+|--------|-----------|
+| **Flat** | All bands at 0 dB |
+| **Rock** | V-curve: punchy bass, scooped 500 Hz–2 kHz, crisp highs |
+| **Pop** | Forward mid-presence for vocal clarity |
+| **Classical** | Warm and airy, gentle presence rolloff |
+| **Jazz** | Rich low-mids, smooth top end |
+| **Electronic** | Heavy sub-bass and high sparkle |
+
+### Custom presets
+
+Custom presets are saved in `~/.ncradio.conf` as
+`eq_preset_<name>=<12 comma-separated gain values>`. Up to 16 custom presets
+are supported. The name of the last active preset is also saved so the
+displayed name is correct after a restart.
+
+### Backend notes
+
+- **PipeWire build**: EQ is applied in the playback callback only. Recordings
+  made with MP3 recording capture pre-EQ (raw) audio.
+- **ALSA build**: EQ is applied in-place in the capture buffer before both
+  playback and recording, so recordings include the EQ curve.
+
 ## Configuration file
 
 Settings and presets are stored together in `~/.ncradio.conf`:
@@ -404,6 +492,10 @@ audio_mute_seek=1
 record_bitrate=128
 record_stereo=1
 record_samplerate=44100
+eq_enabled=1
+eq_active_preset=Rock
+eq_gains=4.0,3.0,2.0,0.0,-1.0,-2.0,-1.0,0.0,2.0,3.0,3.0,2.0
+eq_preset_MyBass=6.0,5.0,4.0,2.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
 # stations
 87.90 BBC Radio 1
 91.30
@@ -431,6 +523,10 @@ PipeWire, or an ALSA `hw:CARD=<id>,DEV=0` string when built with ALSA.
 | `record_bitrate` | kbps (e.g. `128`) | MP3 encoding bitrate |
 | `record_stereo` | `0` or `1` | Output channel count for recordings (1=stereo, 0=mono) |
 | `record_samplerate` | Hz (e.g. `44100`) | Output sample rate for recordings |
+| `eq_enabled` | `0` or `1` | Whether the EQ is active |
+| `eq_active_preset` | name string | Name of the last active preset; empty = unsaved custom curve |
+| `eq_gains` | 12 comma-separated floats | Per-band gain values in dB (−12 … +12) |
+| `eq_preset_<name>` | 12 comma-separated floats | A saved custom EQ preset named `<name>` |
 
 **Station lines** — frequency in MHz, optional name after a space. Lines
 starting with `#` are comments.

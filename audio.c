@@ -1,4 +1,7 @@
 #include "audio.h"
+#ifdef HAVE_EQ
+#include "eq.h"
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -64,6 +67,14 @@ static void pw_cap_param_changed(void *data, uint32_t id,
     s->stride          = channels * 2;
     s->audio->rate     = rate;
     s->audio->channels = (int)channels;
+
+#ifdef HAVE_EQ
+    if (s->audio->eq) {
+        pthread_mutex_lock(&s->audio->eq->lock);
+        eq_init(s->audio->eq, (double)rate);
+        pthread_mutex_unlock(&s->audio->eq->lock);
+    }
+#endif
 
     /* Update capture buffer params to match negotiated stride. */
     uint8_t buf[1024];
@@ -176,6 +187,11 @@ static void pw_play_process(void *data)
                                  index & (PW_RING_BYTES - 1),
                                  d->data, fill);
         spa_ringbuffer_read_update(&s->ring, (int32_t)(index + fill));
+#ifdef HAVE_EQ
+        if (s->audio->eq)
+            eq_process(s->audio->eq, (short *)d->data,
+                       (int)(fill / s->stride), s->audio->channels);
+#endif
     }
     if (fill < req)
         memset((uint8_t *)d->data + fill, 0, req - fill);
@@ -653,6 +669,14 @@ static void *audio_fn(void *arg)
     a->rate     = rate;
     a->channels = channels;
 
+#ifdef HAVE_EQ
+    if (a->eq) {
+        pthread_mutex_lock(&a->eq->lock);
+        eq_init(a->eq, (double)rate);
+        pthread_mutex_unlock(&a->eq->lock);
+    }
+#endif
+
     if (snd_pcm_prepare(cap) < 0 || snd_pcm_start(cap) < 0) {
         snprintf(a->errmsg, sizeof(a->errmsg), "cannot start capture device");
         goto done;
@@ -700,6 +724,10 @@ static void *audio_fn(void *arg)
             }
             continue;
         }
+#ifdef HAVE_EQ
+        if (a->eq)
+            eq_process(a->eq, buf, (int)n, a->channels);
+#endif
         snd_pcm_sframes_t w = snd_pcm_writei(play, buf, (snd_pcm_uframes_t)n);
         if (w < 0) {
             if (snd_pcm_recover(play, (int)w, 1) < 0)

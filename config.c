@@ -16,7 +16,7 @@ static const char *path(void)
 
 static void settings_defaults(Config *c)
 {
-    if (c->scan_step_hz < 25000 || c->scan_step_hz > 1000000)
+    if (c->scan_step_hz < 50000 || c->scan_step_hz > 1000000)
         c->scan_step_hz = DEFAULT_SCAN_STEP_HZ;
     if (c->signal_threshold_pct < 5 || c->signal_threshold_pct > 95)
         c->signal_threshold_pct = DEFAULT_SIGNAL_THRESH_PCT;
@@ -45,15 +45,15 @@ int config_load(Config *c)
     FILE *f = fopen(path(), "r");
     if (!f) return 0;
 
-    char line[128];
+    char line[256];
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
 
         /* Settings line: key=value (first char not a digit) */
         if (strchr(line, '=') && !isdigit((unsigned char)line[0])) {
-            char key[40]  = {0};
-            char sval[80] = {0};
-            if (sscanf(line, "%39[^=]=%79[^\n]", key, sval) < 1) continue;
+            char key[64]   = {0};
+            char sval[192] = {0};
+            if (sscanf(line, "%63[^=]=%191[^\n]", key, sval) < 1) continue;
             int ival = atoi(sval);
 
             if      (strcmp(key, "scan_step")        == 0) c->scan_step_hz = (uint32_t)ival;
@@ -74,6 +74,34 @@ int config_load(Config *c)
             } else if (strcmp(key, "audio_play_device") == 0) {
                 strncpy(c->audio_play_device, sval, sizeof(c->audio_play_device) - 1);
                 c->audio_play_device[sizeof(c->audio_play_device) - 1] = '\0';
+            } else if (strcmp(key, "eq_enabled") == 0) {
+                c->eq_enabled = ival ? 1 : 0;
+            } else if (strcmp(key, "eq_active_preset") == 0) {
+                size_t plen = strlen(sval);
+                if (plen >= EQ_CUSTOM_NAMELEN) plen = EQ_CUSTOM_NAMELEN - 1;
+                memcpy(c->eq_active_preset, sval, plen);
+                c->eq_active_preset[plen] = '\0';
+            } else if (strcmp(key, "eq_gains") == 0) {
+                char *tok = sval;
+                for (int i = 0; i < EQ_BANDS && tok; i++) {
+                    c->eq_gains[i] = (float)atof(tok);
+                    tok = strchr(tok, ',');
+                    if (tok) tok++;
+                }
+            } else if (strncmp(key, "eq_preset_", 10) == 0) {
+                if (c->eq_custom_count < EQ_CUSTOM_MAX) {
+                    int p = c->eq_custom_count++;
+                    size_t nlen = strlen(key + 10);
+                    if (nlen >= EQ_CUSTOM_NAMELEN) nlen = EQ_CUSTOM_NAMELEN - 1;
+                    memcpy(c->eq_custom[p].name, key + 10, nlen);
+                    c->eq_custom[p].name[nlen] = '\0';
+                    char *tok = sval;
+                    for (int i = 0; i < EQ_BANDS && tok; i++) {
+                        c->eq_custom[p].gains[i] = (float)atof(tok);
+                        tok = strchr(tok, ',');
+                        if (tok) tok++;
+                    }
+                }
             }
             continue;
         }
@@ -124,6 +152,18 @@ int config_save(const Config *c)
     if (c->audio_device[0])
         fprintf(f, "audio_device=%s\n",      c->audio_device);
     fprintf(f, "audio_play_device=%s\n",     c->audio_play_device);
+    fprintf(f, "eq_enabled=%d\n", c->eq_enabled);
+    fprintf(f, "eq_active_preset=%s\n", c->eq_active_preset);
+    fprintf(f, "eq_gains=");
+    for (int i = 0; i < EQ_BANDS; i++)
+        fprintf(f, i ? ",%.1f" : "%.1f", (double)c->eq_gains[i]);
+    fputc('\n', f);
+    for (int p = 0; p < c->eq_custom_count; p++) {
+        fprintf(f, "eq_preset_%s=", c->eq_custom[p].name);
+        for (int i = 0; i < EQ_BANDS; i++)
+            fprintf(f, i ? ",%.1f" : "%.1f", (double)c->eq_custom[p].gains[i]);
+        fputc('\n', f);
+    }
     fprintf(f, "# stations\n");
     for (int i = 0; i < c->count; i++) {
         if (c->names[i][0])
@@ -164,4 +204,23 @@ int config_find(const Config *c, uint32_t hz)
     for (int i = 0; i < c->count; i++)
         if (c->freqs[i] == hz) return i;
     return -1;
+}
+
+int config_eq_preset_add(Config *c, const char *name, const float gains[EQ_BANDS])
+{
+    if (c->eq_custom_count >= EQ_CUSTOM_MAX || !name || !name[0]) return -1;
+    int idx = c->eq_custom_count++;
+    strncpy(c->eq_custom[idx].name, name, EQ_CUSTOM_NAMELEN - 1);
+    c->eq_custom[idx].name[EQ_CUSTOM_NAMELEN - 1] = '\0';
+    for (int i = 0; i < EQ_BANDS; i++)
+        c->eq_custom[idx].gains[i] = gains[i];
+    return idx;
+}
+
+void config_eq_preset_del(Config *c, int idx)
+{
+    if (idx < 0 || idx >= c->eq_custom_count) return;
+    for (int i = idx; i < c->eq_custom_count - 1; i++)
+        c->eq_custom[i] = c->eq_custom[i + 1];
+    c->eq_custom_count--;
 }
