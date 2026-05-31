@@ -851,11 +851,13 @@ static void draw_help(void)
         } else if (eq_sel_row == 0) {
             mvprintw(y + 1, 2,
                      "Left/Right:band   Up/Dn:+/-1dB   PgUp/PgDn:+/-3dB   "
-                     "S:save preset   []:cycle presets   Space:toggle   Esc/E:back");
+                     "S:save preset   []:cycle presets");
+            mvprintw(y + 2, 2, "Space:toggle   Esc/E:back");
         } else {
             mvprintw(y + 1, 2,
                      "Left/Right:cycle presets   Tab/Enter:edit bands   "
-                     "S:save preset   Del:delete   Space:toggle   Esc/E:back");
+                     "S:save preset   Del:delete");
+            mvprintw(y + 2, 2, "Space:toggle   Esc/E:back");
         }
         break;
 #endif
