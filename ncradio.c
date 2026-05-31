@@ -405,7 +405,7 @@ static void draw_eq(void)
 {
     int top     = ROW_LIST;
     int rows    = list_rows();            /* usable rows in the list area */
-    int bar_max = (rows - 5) / 2;        /* rows available for +/- bars */
+    int bar_max = (rows - 4) / 2;        /* rows available for +/- bars */
     if (bar_max < 1) bar_max = 1;
     int db_per_row = 12 / bar_max + 1;   /* dB represented by one row */
 
@@ -441,7 +441,7 @@ static void draw_eq(void)
     for (int c = 0; c < COLS; c++) mvaddch(top + 1, c, ACS_HLINE);
 
     /* --- Bar graph --- */
-    int zero_row = top + 2 + bar_max;  /* screen row for 0 dB */
+    int zero_row = top + 1 + bar_max;  /* screen row for 0 dB */
 
     /* Clear bar area */
     for (int r = top + 2; r <= zero_row + bar_max; r++) {
@@ -474,7 +474,7 @@ static void draw_eq(void)
         if (g >= 0) {
             for (int k = 0; k < cells; k++) {
                 int r = zero_row - 1 - k;
-                if (r >= top + 3)
+                if (r >= top + 2)
                     mvaddch(r, col + band_w / 2, ACS_BLOCK);
             }
         } else {
