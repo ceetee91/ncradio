@@ -76,9 +76,10 @@ rate          — detected/fixed sample rate, set by thread at startup
 channels      — detected/fixed channel count, set by thread at startup
 errmsg[]      — last error string; empty while running normally
 eq            — pointer to the Eq instance; NULL or HAVE_EQ not set → no EQ
-rec_lock      — mutex protecting rec_fn and rec_ctx
+rec_lock      — mutex protecting rec_fn, rec_ctx, and rec_eq_apply
 rec_fn        — recording callback; called after each captured period
 rec_ctx       — opaque pointer passed to rec_fn
+rec_eq_apply  — 1 = apply eq_process() to PCM before rec_fn (HAVE_EQ)
 ```
 
 ---
@@ -104,15 +105,17 @@ negotiated, using the same rate, limiting total resampling to at most one hop
 
 ```
 [radio card] ─PipeWire graph─▶ pw_cap_process callback
-                                    │  (raw PCM → ring buffer; calls rec_fn)
+                                    │  (raw PCM → ring buffer)
                                     ├─▶ spa_ringbuffer (2 MiB, lock-free)
                                     │        │
                                     │        ▼
                                     │   pw_play_process callback
                                     │       └─▶ eq_process() [HAVE_EQ] ──▶ [speakers]
                                     │
-                                    └─▶ rec_fn(rec_ctx, pcm, frames, channels)
-                                              (inside rec_lock; pre-EQ audio)
+                                    └─▶ rec_fn(rec_ctx, pcm, frames, channels)  [inside rec_lock]
+                                              rec_eq_apply=0: raw (pre-EQ) PCM passed directly
+                                              rec_eq_apply=1: eq_process() applied to alloca
+                                                              copy first, then copy passed [HAVE_EQ]
 ```
 
 **Ring buffer usage** — `spa_ringbuffer_get_write_index` / `spa_ringbuffer_get_read_index`
@@ -168,12 +171,18 @@ absent.
 ```
 while a->running:
     snd_pcm_readi(cap, buf, period)   — blocks ~100 ms per period
+    [HAVE_EQ] if a->eq && !rec_eq_apply:
+        lock(rec_lock)
+        if rec_fn: rec_fn(rec_ctx, buf, n, channels)  — raw audio
+        unlock(rec_lock)
     if a->eq: eq_process(a->eq, buf, n, channels)  [HAVE_EQ]
     snd_pcm_writei(play, buf, n)
     snd_pcm_recover on xrun in either direction
-    lock(rec_lock)
-    if rec_fn: rec_fn(rec_ctx, buf, n, channels)   — post-EQ audio
-    unlock(rec_lock)
+    [HAVE_EQ] if !a->eq || rec_eq_apply:
+        lock(rec_lock)
+        if rec_fn: rec_fn(rec_ctx, buf, n, channels)  — post-EQ audio
+        unlock(rec_lock)
+    (no-HAVE_EQ path always records after writei)
 ```
 
 **`audio_enum_devices`** — iterates ALSA cards via `snd_card_next` /
@@ -345,6 +354,7 @@ int      audio_mute_seek                     — 1 = stop audio pipe while seeki
 int      record_bitrate                      — MP3 bitrate kbps (64/96/128/192/256/320)
 int      record_stereo                       — 1 = stereo output, 0 = mono
 int      record_samplerate                   — output sample rate Hz (22050/44100/48000)
+int      record_eq_enabled                   — 1 = apply EQ curve to recordings when EQ is on
 int      eq_enabled                          — 1 = EQ active at startup [HAVE_EQ]
 float    eq_gains[EQ_BANDS]                  — per-band gain in dB, −12…+12 [HAVE_EQ]
 char     eq_active_preset[EQ_CUSTOM_NAMELEN] — name of active preset; "" = unsaved [HAVE_EQ]
@@ -515,7 +525,8 @@ LINES-1        second help line (M_NORMAL only)
 - absent — audio disabled in config
 
 **Settings panel** (`draw_settings()`) — ten rows when only audio is compiled
-in; thirteen rows when both audio and lame are present:
+in; thirteen rows when both audio and lame are present; fourteen rows when
+audio, lame, and EQ are all compiled in:
 
 ```
 Row +2   Scan step:            0.10 MHz         <- -> to cycle
@@ -530,6 +541,7 @@ Row +10  Mute while seeking:   Yes              <- -> or Enter to toggle
 Row +11  Record bitrate:       128 kbps         <- -> to cycle        ← HAVE_LAME
 Row +12  Record channels:      Stereo           <- -> to toggle       ← HAVE_LAME
 Row +13  Record sample rate:   44100 Hz         <- -> to cycle        ← HAVE_LAME
+Row +14  Apply EQ to recs:     Yes              <- -> or Enter toggle  ← HAVE_LAME + HAVE_EQ
 ```
 
 **`audio_apply()`** — called on startup and whenever audio settings change:
@@ -652,11 +664,14 @@ race).
     │                   ├─ snd_pcm_open(hw:CARD=x,DEV=0, CAPTURE)
     │                   ├─ probe rate, configure S16_LE
     │                   ├─ snd_pcm_open("default", PLAYBACK)
-    │                   └─ snd_pcm_readi → eq_process [HAVE_EQ] → snd_pcm_writei → rec_fn(rec_ctx) loop
+    │                   └─ snd_pcm_readi → [rec_fn if !rec_eq_apply] →
+    │                      eq_process [HAVE_EQ] → snd_pcm_writei →
+    │                      [rec_fn if rec_eq_apply or no EQ] loop
     │
-    ├─ record_open → audio.rec_fn/rec_ctx set ← r key (HAVE_LAME)
+    ├─ record_open → audio.rec_fn/rec_ctx/rec_eq_apply set ← r key (HAVE_LAME)
     │       └─ lame_init → lame_init_params → fopen(path)
-    │          [audio thread calls record_feed each period]
+    │          [audio thread calls record_feed each period;
+    │           PCM may be EQ-processed first if rec_eq_apply=1 (HAVE_EQ)]
     │
     ├─ recording_stop                         ← s/Esc/q in M_RECORDING
     │       └─ lock rec_lock, clear rec_fn/ctx, unlock → record_close

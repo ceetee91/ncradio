@@ -383,9 +383,16 @@ The recording format is configurable from the settings panel:
 | Record bitrate | 128 kbps | 64 / 96 / 128 / 192 / 256 / 320 kbps |
 | Record channels | Stereo | Stereo / Mono |
 | Record sample rate | 44100 Hz | 22050 / 44100 / 48000 Hz |
+| Apply EQ to recs | Yes | Yes / No |
 
 The encoder receives PCM at the pipe's capture rate and channels and resamples
 / downmixes as needed to produce the configured output format.
+
+When **Apply EQ to recs** is **Yes** (default) and the equalizer is enabled,
+the active EQ curve is applied to the recorded audio so the MP3 reflects what
+you hear. When set to **No**, recordings capture the unprocessed signal
+regardless of the EQ state. This setting is only shown when both the equalizer
+and MP3 recording are compiled in.
 
 ## Preset list
 
@@ -423,6 +430,7 @@ written to `~/.ncradio.conf` on every adjustment.
 | Record bitrate | 128 kbps | 64 / 96 / 128 / 192 / 256 / 320 kbps | MP3 bitrate for recordings (shown only when lame is compiled in) |
 | Record channels | Stereo | Stereo / Mono | Output channels for recordings |
 | Record sample rate | 44100 Hz | 22050 / 44100 / 48000 Hz | Output sample rate for recordings |
+| Apply EQ to recs | Yes | Yes / No | Apply the EQ curve to recordings when EQ is on (shown only when both lame and EQ are compiled in) |
 
 ## Equalizer
 
@@ -469,10 +477,14 @@ displayed name is correct after a restart.
 
 ### Backend notes
 
-- **PipeWire build**: EQ is applied in the playback callback only. Recordings
-  made with MP3 recording capture pre-EQ (raw) audio.
-- **ALSA build**: EQ is applied in-place in the capture buffer before both
-  playback and recording, so recordings include the EQ curve.
+- **PipeWire build**: EQ is applied in the playback callback. When **Apply EQ
+  to recs** is Yes, a separate EQ pass is applied to a copy of the capture
+  buffer before it is fed to the encoder. When No, the encoder receives raw
+  (pre-EQ) audio.
+- **ALSA build**: EQ is applied in-place to the shared capture buffer. When
+  **Apply EQ to recs** is Yes, the EQ is applied before the recording callback
+  so the encoder receives the equalized audio. When No, the raw buffer is
+  recorded first, then EQ is applied for playback.
 
 ## Configuration file
 
@@ -523,6 +535,7 @@ PipeWire, or an ALSA `hw:CARD=<id>,DEV=0` string when built with ALSA.
 | `record_bitrate` | kbps (e.g. `128`) | MP3 encoding bitrate |
 | `record_stereo` | `0` or `1` | Output channel count for recordings (1=stereo, 0=mono) |
 | `record_samplerate` | Hz (e.g. `44100`) | Output sample rate for recordings |
+| `record_eq_enabled` | `0` or `1` | Apply EQ curve to recordings when EQ is on (default 1) |
 | `eq_enabled` | `0` or `1` | Whether the EQ is active |
 | `eq_active_preset` | name string | Name of the last active preset; empty = unsaved custom curve |
 | `eq_gains` | 12 comma-separated floats | Per-band gain values in dB (−12 … +12) |

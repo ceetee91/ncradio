@@ -87,7 +87,12 @@ static int settings_sel = 0;
 #define SETTING_REC_BITRATE     9
 #define SETTING_REC_STEREO      10
 #define SETTING_REC_SAMPLERATE  11
+#ifdef HAVE_EQ
+#define SETTING_REC_EQ          12
+#define SETTING_COUNT           13
+#else
 #define SETTING_COUNT           12
+#endif
 #else
 #define SETTING_COUNT           9
 #endif
@@ -523,6 +528,9 @@ static void draw_settings(void)
         "Record bitrate:",
         "Record channels:",
         "Record sample rate:",
+#ifdef HAVE_EQ
+        "Apply EQ to recs:",
+#endif
 #endif
 #endif
     };
@@ -541,6 +549,9 @@ static void draw_settings(void)
         "<- -> to cycle",
         "<- -> to toggle",
         "<- -> to cycle",
+#ifdef HAVE_EQ
+        "<- -> or Enter to toggle",
+#endif
 #endif
 #endif
     };
@@ -618,6 +629,12 @@ static void draw_settings(void)
         case SETTING_REC_SAMPLERATE:
             snprintf(valstr, sizeof(valstr), "%d Hz", config.record_samplerate);
             break;
+#ifdef HAVE_EQ
+        case SETTING_REC_EQ:
+            snprintf(valstr, sizeof(valstr), "%s",
+                     config.record_eq_enabled ? "Yes" : "No");
+            break;
+#endif
 #endif
 #endif
         }
@@ -1271,6 +1288,11 @@ static void handle_settings_key(int ch)
             idx = right ? (idx + 1) % nr : (idx + nr - 1) % nr;
             config.record_samplerate = rates[idx];
             config_save(&config);
+#ifdef HAVE_EQ
+        } else if (settings_sel == SETTING_REC_EQ) {
+            config.record_eq_enabled = !config.record_eq_enabled;
+            config_save(&config);
+#endif
 #endif
 #endif
         }
@@ -1296,6 +1318,11 @@ static void handle_settings_key(int ch)
         } else if (settings_sel == SETTING_REC_STEREO) {
             config.record_stereo = !config.record_stereo;
             config_save(&config);
+#ifdef HAVE_EQ
+        } else if (settings_sel == SETTING_REC_EQ) {
+            config.record_eq_enabled = !config.record_eq_enabled;
+            config_save(&config);
+#endif
 #endif
 #endif
         }
@@ -1419,8 +1446,9 @@ static void handle_key(int ch)
                 break;
             }
             pthread_mutex_lock(&audio.rec_lock);
-            audio.rec_ctx = r;
-            audio.rec_fn  = recording_cb;
+            audio.rec_ctx      = r;
+            audio.rec_fn       = recording_cb;
+            audio.rec_eq_apply = config.record_eq_enabled;
             pthread_mutex_unlock(&audio.rec_lock);
             rec_start_time = time(NULL);
             mode = M_RECORDING;

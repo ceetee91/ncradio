@@ -21,6 +21,7 @@
 #define DEFAULT_RECORD_BITRATE         128   /* kbps */
 #define DEFAULT_RECORD_STEREO            1   /* 1=stereo 0=mono */
 #define DEFAULT_RECORD_SAMPLERATE    44100   /* Hz */
+#define DEFAULT_RECORD_EQ_ENABLED        1   /* 1=apply EQ to recordings */
 
 typedef struct {
     /* stations */
@@ -48,9 +49,10 @@ typedef struct {
     int      audio_mute_seek;       /* stop audio pipe while seeking */
 
     /* MP3 recording settings */
-    int      record_bitrate;    /* kbps: 64/96/128/192/256/320 */
-    int      record_stereo;     /* 1=stereo 0=mono */
-    int      record_samplerate; /* Hz: 22050/44100/48000 */
+    int      record_bitrate;      /* kbps: 64/96/128/192/256/320 */
+    int      record_stereo;       /* 1=stereo 0=mono */
+    int      record_samplerate;   /* Hz: 22050/44100/48000 */
+    int      record_eq_enabled;   /* 1=apply EQ curve to recordings when EQ is on */
 
     /* Equalizer settings */
     int      eq_enabled;

@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
+#include <alloca.h>
 #ifdef HAVE_UDEV
 #include <libudev.h>
 #endif
@@ -132,8 +133,17 @@ static void pw_cap_process(void *data)
         pthread_mutex_lock(&s->audio->rec_lock);
         if (s->audio->rec_fn && s->stride > 0) {
             int frames = (int)(size / s->stride);
-            s->audio->rec_fn(s->audio->rec_ctx, pcm, frames,
-                             s->audio->channels);
+#ifdef HAVE_EQ
+            if (s->audio->rec_eq_apply && s->audio->eq) {
+                short *tmp = (short *)alloca(size);
+                memcpy(tmp, pcm, size);
+                eq_process(s->audio->eq, tmp, frames, s->audio->channels);
+                s->audio->rec_fn(s->audio->rec_ctx, tmp, frames,
+                                 s->audio->channels);
+            } else
+#endif
+                s->audio->rec_fn(s->audio->rec_ctx, pcm, frames,
+                                 s->audio->channels);
         }
         pthread_mutex_unlock(&s->audio->rec_lock);
     }
@@ -732,6 +742,12 @@ static void *audio_fn(void *arg)
             continue;
         }
 #ifdef HAVE_EQ
+        if (a->eq && !a->rec_eq_apply) {
+            /* rec_eq_apply=0: record raw audio before applying EQ */
+            pthread_mutex_lock(&a->rec_lock);
+            if (a->rec_fn) a->rec_fn(a->rec_ctx, buf, (int)n, a->channels);
+            pthread_mutex_unlock(&a->rec_lock);
+        }
         if (a->eq)
             eq_process(a->eq, buf, (int)n, a->channels);
 #endif
@@ -740,9 +756,16 @@ static void *audio_fn(void *arg)
             if (snd_pcm_recover(play, (int)w, 1) < 0)
                 snd_pcm_prepare(play);
         }
-        pthread_mutex_lock(&a->rec_lock);
-        if (a->rec_fn) a->rec_fn(a->rec_ctx, buf, (int)n, a->channels);
-        pthread_mutex_unlock(&a->rec_lock);
+#ifdef HAVE_EQ
+        if (!a->eq || a->rec_eq_apply) {
+            /* rec_eq_apply=1 (or no EQ): record after EQ is applied */
+#endif
+            pthread_mutex_lock(&a->rec_lock);
+            if (a->rec_fn) a->rec_fn(a->rec_ctx, buf, (int)n, a->channels);
+            pthread_mutex_unlock(&a->rec_lock);
+#ifdef HAVE_EQ
+        }
+#endif
     }
 
 done:

@@ -51,6 +51,7 @@ int config_load(Config *c)
     c->record_bitrate       = DEFAULT_RECORD_BITRATE;
     c->record_stereo        = DEFAULT_RECORD_STEREO;
     c->record_samplerate    = DEFAULT_RECORD_SAMPLERATE;
+    c->record_eq_enabled    = DEFAULT_RECORD_EQ_ENABLED;
 
     FILE *f = fopen(path(), "r");
     if (!f) return 0;
@@ -78,6 +79,7 @@ int config_load(Config *c)
             else if (strcmp(key, "record_bitrate")     == 0) c->record_bitrate = ival;
             else if (strcmp(key, "record_stereo")      == 0) c->record_stereo = ival ? 1 : 0;
             else if (strcmp(key, "record_samplerate")  == 0) c->record_samplerate = ival;
+            else if (strcmp(key, "record_eq_enabled")  == 0) c->record_eq_enabled = ival ? 1 : 0;
             else if (strcmp(key, "audio_device")       == 0) {
                 strncpy(c->audio_device, sval, sizeof(c->audio_device) - 1);
                 c->audio_device[sizeof(c->audio_device) - 1] = '\0';
@@ -159,6 +161,7 @@ int config_save(const Config *c)
     fprintf(f, "record_bitrate=%d\n",        c->record_bitrate);
     fprintf(f, "record_stereo=%d\n",         c->record_stereo);
     fprintf(f, "record_samplerate=%d\n",     c->record_samplerate);
+    fprintf(f, "record_eq_enabled=%d\n",     c->record_eq_enabled);
     if (c->audio_device[0])
         fprintf(f, "audio_device=%s\n",      c->audio_device);
     fprintf(f, "audio_play_device=%s\n",     c->audio_play_device);

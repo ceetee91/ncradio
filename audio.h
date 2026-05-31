@@ -27,6 +27,7 @@ typedef struct {
     pthread_mutex_t rec_lock;
     void (*rec_fn)(void *ctx, const short *pcm, int frames, int channels);
     void  *rec_ctx;
+    int    rec_eq_apply;  /* 1 = pass EQ-processed PCM to rec_fn (HAVE_EQ) */
 } Audio;
 
 /* Start audio pipe: capture from device → playback on play_device (or default).
