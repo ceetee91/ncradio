@@ -3,7 +3,7 @@
 A small ncurses FM radio controller for Linux, built for V4L2-compatible tuner
 cards and USB radio sticks accessible as `/dev/radio0`. Includes a live audio
 pipe that routes the tuner's capture output to the system's default playback
-device.
+device. Tested with ADS Tech InstantFM Music RDX-155.
 
 ```
               ncradio v0.1
@@ -17,7 +17,7 @@ device.
    2.  91.30 Classic     5. 101.00              8. 107.30
    3.  94.50 Radio 3     6. 103.60 LBC          9. 107.90
 ──────────────────────────────────────────────────────────────────
- s:scan  ,:step<  .:step>  <:seek<  >:seek>  t:tune  m:mute  +/-:vol
+ s:scan  ,:step-  .:step+  <:seek-  >:seek+  t:tune  m:mute  +/-:vol
  a:add  d:del  e:rename  o:settings  arrows:navigate  Enter:tune  q:quit
 ```
 
@@ -25,7 +25,7 @@ device.
 
 **Runtime:**
 - Linux kernel with V4L2 radio support (`/dev/radio0`)
-- PipeWire (preferred) **or** ALSA (`libasound`) for audio output
+- PipeWire (preferred) **or** ALSA (`libasound`) for audio output (optional; falls back to tuner control only)
 - `libudev` for automatic audio device detection (optional; falls back to sysfs)
 - `libmp3lame` for MP3 recording (optional)
 
@@ -153,8 +153,8 @@ and volume are persisted.
 
 | Key | Action |
 |-----|--------|
-| `s` or `Esc` | Stop scan early, save results, return to normal |
-| `q` | Stop scan, save results, quit |
+| `s` | Stop scan early, save results |
+| `Esc` | Stop scan, discard results |
 
 ### Seek mode (after pressing `<` or `>`)
 
@@ -180,7 +180,7 @@ All tuning, scanning, seeking, mute, and settings keys are blocked while recordi
 | `s` or `Esc` | Stop recording and save file |
 | `q` | Stop recording, save file, and quit |
 
-The info row shows `● REC 0:00 filename` with a running elapsed time.
+The info row shows `- REC 0:00 filename` with a running elapsed time.
 
 ### Settings panel (after pressing `o`)
 
@@ -389,7 +389,7 @@ written to `~/.ncradio.conf` on every adjustment.
 | Setting | Default | Range / values | Description |
 |---------|---------|----------------|-------------|
 | Scan step | 0.10 MHz | 0.025 / 0.05 / 0.10 / 0.20 MHz | Frequency increment for scan, manual step, and seek |
-| Signal threshold | 30% | 5% – 95% (5% steps) | Minimum signal strength to record a station during scan/seek |
+| Signal threshold | 50% | 5% – 95% (5% steps) | Minimum signal strength to record a station during scan/seek |
 | Save RDS names | Yes | Yes / No | Whether to pause on each found station to collect its RDS PS name during scan |
 | Audio output | Off | Off / On | Enable or disable the audio pipe |
 | Capture device | (auto) | detected capture devices | Capture device / PipeWire source node |
@@ -408,7 +408,7 @@ Settings and presets are stored together in `~/.ncradio.conf`:
 ```
 # ncradio configuration
 scan_step=100000
-signal_threshold=30
+signal_threshold=50
 rds_names=1
 volume=80
 last_freq=98500000

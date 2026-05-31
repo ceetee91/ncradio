@@ -18,7 +18,7 @@
 #include "record.h"
 #endif
 
-#define VERSION "0.1"
+#define VERSION "1.0"
 
 /* Fixed layout rows */
 #define ROW_TITLE  0
